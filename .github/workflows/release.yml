@@ -1,0 +1,401 @@
+name: release
+
+# Builds the release artifacts -- cp311/cp312 manylinux_2_28 x86_64 wheels plus an sdist -- and
+# publishes them to PyPI on a pushed `v*` tag.
+#
+# PUBLICATION IS A SEPARATE, GATED JOB (#306), never a step appended to the build:
+#   * `needs:` the build jobs, so nothing publishes that has not passed the rust-availability
+#     assert;
+#   * a protected `environment:`, so an upload is reviewable before it happens;
+#   * trusted publishing (`id-token: write`) rather than a long-lived API token;
+#   * `if:` restricted to a PUSHED tag. A `workflow_dispatch` can reach the build and TestPyPI
+#     and NOTHING else -- dispatch is what makes this workflow verifiable without burning a
+#     version number, and a version can never be re-uploaded to PyPI.
+#
+# The `github.repository ==` guard on the PyPI job is load-bearing, not decoration. This file
+# also lives in the private development repo, which does get `v*` tags of its own; without the
+# guard each one would queue a real upload attempt. Positive allowlist, so a fork or a move
+# fails CLOSED (publishing stops) rather than open. If the repo is ever renamed, this line
+# moves with it -- and so does the PyPI trusted publisher, which binds to
+# owner + repo + THIS FILENAME + environment.
+#
+# Platform scope is deliberate and narrow (#306), and it is NARROWER than "everything else
+# builds from the sdist". Getting this wrong in the README is how a package acquires bug reports
+# from platforms it never supported, so state it exactly:
+#
+#   SUPPORTED: Linux x86_64 with SSE4.1, glibc >= 2.28 (the manylinux_2_28 baseline), CPython
+#   3.11 and 3.12. That is what the wheels cover and what CI tests.
+#
+#   The SSE4.1 part is NOT expressed by the wheel tag -- `manylinux_2_28_x86_64` is a glibc
+#   statement only. `rust/build.rs` compiles the vendored FastPFor with `-msse4.1` and
+#   `rust/csrc/pfor_shim.cpp` asks the factory for `simdfastpfor256`, so on a pre-SSE4.1 x86_64
+#   the wheel installs and the default pfordelta path faults.
+#
+#   Do NOT reassure anyone with a date. An earlier version of this comment said "every x86_64 CPU
+#   since ~2008", which is wrong: AMD's K10 / Phenom II line shipped SSE4a rather than SSE4.1 and
+#   AMD only gained SSE4.1 with Bulldozer in 2011, and the early Bonnell Atoms lack it too. The
+#   correct instruction to a user is `grep sse4_1 /proc/cpuinfo`. (codex round 3.)
+#
+#   The sdist ships for archival and for downstream packagers, and it does produce a working,
+#   Rust-enabled install on Linux (and macOS) *x86_64 WITH SSE4.1* given BOTH a Rust toolchain and
+#   a C++11 compiler -- `rust/build.rs` drives `cc` over the vendored FastPFor, so Rust alone is
+#   not enough, and `-msse4.1` is applied on the source path too, so building from source lowers
+#   the glibc floor but NOT the ISA floor. The sdist job below smoke-tests exactly one
+#   configuration (Ubuntu, cp311); it is not a portability matrix. It is NOT a portability story:
+#     * Windows: `import cellstream` fails outright. `cellstream/lock.py` does `import fcntl` at
+#       module scope and `cellstream/cell/__init__.py` reaches it through `archive_writer`.
+#     * aarch64, including Apple Silicon: the crate compiles, but `rust/src/cell.rs` is
+#       `#![cfg(target_arch = "x86_64")]` and `rust/build.rs` skips the vendored FastPFor build
+#       off x86 (FastPFor is x86 SIMD). The per-cell entry points are therefore ABSENT:
+#       `rust_available()` is False and a per-cell read raises unless the caller opts into the
+#       pure-Python fallback. With that opt-in a ZSTD archive decodes and needs no extra
+#       (`_import_pyfastpfor` is called only from the pfordelta encoder/decoder), while
+#       PFORDELTA -- the default for integer counts -- has no working backend there at all,
+#       because its pure-Python path needs `pyfastpfor`, itself a binding to the same x86
+#       FastPFor. Do not tell an ARM user to install the `cell` extra. (codex rounds 2 and 3.)
+#   Both are documented as unsupported in the README rather than implied to work. (codex.)
+#
+# What the source build never does is quietly install a pure-Python cellstream whose per-cell
+# reads are much slower with no indication: setup.py declares the extension non-optional, so a
+# missing toolchain FAILS LOUDLY (#244).
+#
+# cp313 is deliberately ABSENT: `bitshuffle` (a required dependency) has no cp313 wheel, so a
+# cp313 build could not offer an ALL-WHEEL dependency install -- it would force an unverified
+# native source build of bitshuffle on every user. (Not strictly impossible; bitshuffle's sdist
+# declares >=3.9.) Unblocking 3.13 needs CODE, not just metadata: cell/codec.py imports
+# v2/codec.py, which does `import bitshuffle` unconditionally at module scope, so
+# `import cellstream` reaches it even on the cell path. Lazy-import it inside the legacy
+# bitshuffle encode/decode functions first, then bitshuffle can become an extra. (#305)
+#
+# --- why the build platform is manylinux_2_28 (#297) ---
+# This workflow had never once succeeded before #304. It always died in cibuildwheel's
+# test-install step, but the cause was the BUILD PLATFORM, not the test: manylinux2014 is no
+# longer compatible with this project's current BINARY DEPENDENCY SET.
+#   * cibuildwheel 2.x defaults x86_64 to the manylinux2014 (== manylinux_2_17) image -- which
+#     is why the produced wheel was tagged `manylinux_2_17_x86_64.manylinux2014_x86_64`;
+#   * pip takes the newest satisfying release, and scipy stopped shipping manylinux_2_17 wheels
+#     at 1.17.0. So it selected an sdist and meson failed on missing OpenBLAS. That is the
+#     traceback, but scipy is not the hard floor;
+#   * the hard floor is `hdf5plugin>=6.0`, whose x86_64 wheels are
+#     `py3-none-manylinux_2_24_x86_64.manylinux_2_28_x86_64` -- there is NO 2_17 wheel at all.
+# So `PIP_ONLY_BINARY=:all:` (the fix guessed in #297) would not have worked either, though not
+# for the reason first written: scipy WOULD have backtracked to 1.16.3, which does have a 2_17
+# wheel. It is hdf5plugin that has no candidate under a binary-only policy. (codex caught this;
+# the first version of this comment blamed scipy alone.)
+#
+# manylinux_2_28 is therefore a deliberate SUPPORT-POLICY choice, not something the metadata
+# forces: hdf5plugin's HARD binary floor is 2_24, current scipy releases carry a 2_27 baseline
+# (scipy's own floor is lower -- 1.16.3 still has a 2_17 wheel, which is the whole point above),
+# and 2_28 is the modern cibuildwheel image that clears both. A 2_17-tagged wheel of ours would
+# not have been a dishonest artifact -- a manylinux tag promises the compatibility of that
+# wheel's OWN native code, not that every dependency resolves. Resolution is a separate question.
+#
+# The cp311/cp312 x86_64 wheels we actually consume from bitshuffle and zstandard are
+# manylinux_2_17, and that is fine: an older-baseline wheel installs on a newer system. Only the
+# reverse breaks, and nothing in the dependency set requires BUILDING in a 2_17 environment.
+# (Scoped deliberately -- zstandard's newer-interpreter wheels do carry 2_28.)
+#
+# NOT verified locally: the docker socket on the dev host rejects non-root
+# (`permission denied ... /var/run/docker.sock`), so `cibuildwheel --platform linux` cannot run
+# there and this is verified by `workflow_dispatch` instead.
+#
+# Release-path actions are pinned to full commit SHAs, not tags (#306): a tag is a moving
+# pointer, and this is the workflow that signs and uploads artifacts. The comment after each
+# `@sha` records which release it is so a bump is a readable diff.
+on:
+  push:
+    # `v[0-9]*`, not `v*`: a tag like `v` or `version-test` would otherwise reach the release
+    # path, build a dev-versioned artifact and queue an irreversible upload. The exact form is
+    # then re-checked against the built filenames before the upload (see publish-pypi). (codex.)
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      testpypi:
+        description: "Also publish to TestPyPI (this input can NEVER reach PyPI)"
+        type: boolean
+        default: false
+
+# Least privilege by default; the jobs that need more opt in. Job-level `permissions` REPLACES
+# this block rather than merging with it, which is why the publish jobs restate nothing they do
+# not need -- they never check out the repo.
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheels (cp311, cp312, manylinux_2_28 x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # setuptools-scm derives the version from tags
+      - uses: pypa/cibuildwheel@7940a4c0e76eb2030e473a5f864f291f63ee879b # v2.21.3
+        env:
+          CIBW_BUILD: "cp311-* cp312-*"
+          # THE #297 FIX. See the header. Available on this action pin: v2.21.3's
+          # pinned_docker_images.cfg already lists manylinux_2_28_x86_64:2024.10.07-1.
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ARCHS_LINUX: x86_64
+          CIBW_SKIP: "*-musllinux_*"
+          # --proto '=https' --tlsv1.2 matches the toolchain install line in README.md; this
+          # snippet gets copied verbatim into CI, so harden it here.
+          CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+          # PIP_ONLY_BINARY=:all: ENFORCES the all-wheel policy the comments above claim.
+          # Without it a future dependency could drop its 2_28 wheel, compile from sdist inside
+          # the container, and leave this workflow GREEN while the stated policy was violated --
+          # the green-that-verified-nothing shape. NB this is the same flag #297 guessed at and
+          # that was argued against: as the SOLE fix on manylinux2014 it could not work, because
+          # hdf5plugin has no 2_17 wheel to fall back to. AFTER moving to 2_28 it is exactly the
+          # right guard. (codex round 2, #304.)
+          CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH" PIP_ONLY_BINARY=:all:'
+          # The whole point of #244: fail the build rather than ship a silently degraded wheel.
+          # This test runs INSIDE cibuildwheel against the repaired wheel, and in v2.21.3's
+          # linux.py the repaired wheel is moved to /output (line 405) only AFTER the test
+          # command runs (line 397). So the bytes uploaded below are provably the bytes that
+          # passed this assert, and a failed assert leaves nothing to upload at all -- which is
+          # also why `if: always()` on the upload step cannot deliver the inspectability it
+          # looks like it offers, and was tried and REVERTED in #304. (Those line numbers hold
+          # ONLY for the pin above and must be re-checked if it moves. Copilot, #304.)
+          CIBW_TEST_COMMAND: >-
+            python -c "import cellstream; s = cellstream.rust_status(); assert s['available'], s"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: success()
+        with:
+          # `if-no-files-found: error` turns upload-artifact's warn-and-upload-nothing outcome
+          # into a FAILURE, so a run cannot report success having shipped no wheel.
+          if-no-files-found: error
+          name: dist-wheels
+          path: ./wheelhouse/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # setuptools-scm derives the version from tags
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist
+      # An sdist that omits rust/ is the #244 failure mode in its worst form: it installs fine
+      # and every source install is silently pure-Python. setuptools_scm's file finder is what
+      # puts rust/ in the archive (it includes git-tracked files), so the archive contents
+      # depend on a build-time plugin working -- assert it rather than assume it.
+      #
+      # `rust/Cargo.lock` is deliberately NOT asserted: `rust/.gitignore` ignores it, as is
+      # normal for a library crate, so the git file finder never sees it and no sdist can
+      # carry it. Asserting it would fail every release. (Found by building an sdist locally
+      # before the first release run, not by CI.)
+      - name: Assert the sdist carries the Rust crate and its vendored FastPFor
+        run: |
+          set -euo pipefail
+          # `sdist=$(echo dist/*.tar.gz)` was the first version and it fails CLOSED but obscurely:
+          # with an empty dist/ the glob stays literal and tar reports "Cannot open dist/*.tar.gz",
+          # and with two archives it becomes one space-separated string tar treats as a single
+          # filename. Neither message names the actual problem, which in this job is always "the
+          # build produced the wrong number of sdists". nullglob + a count says so. (Copilot.)
+          shopt -s nullglob
+          found=(dist/*.tar.gz)
+          [ "${#found[@]}" -eq 1 ] \
+            || { echo "FATAL: expected exactly 1 sdist in dist/, found ${#found[@]}"; exit 1; }
+          sdist="${found[0]}"
+          echo "sdist: $sdist"
+          tar tzf "$sdist" > /tmp/sdist.list
+          for want in \
+            'rust/Cargo.toml' \
+            'rust/build.rs' \
+            'rust/src/lib.rs' \
+            'rust/csrc/pfor_shim.cpp' \
+            'setup.py' \
+            'pyproject.toml' \
+            'README.md' ; do
+            grep -q "/${want}\$" /tmp/sdist.list \
+              || { echo "FATAL: sdist is missing ${want}"; exit 1; }
+          done
+          # The vendored FastPFor C++ the pfordelta codec compiles against. Matched as a tree,
+          # not a single file, so a re-vendor that renames files still passes while a DROPPED
+          # vendor directory fails.
+          grep -qE '/rust/vendor/.+\.(h|hpp|cpp|cc)$' /tmp/sdist.list \
+            || { echo "FATAL: sdist carries no vendored FastPFor sources"; exit 1; }
+          echo "sdist contents OK ($(wc -l < /tmp/sdist.list) members)"
+      # The sdist is what a non-wheel platform actually gets, and this is the first release that
+      # ships one, so install it the way they will. SCOPE: one configuration -- Ubuntu, cp311,
+      # x86_64. It proves the archive builds a Rust-enabled install; it is NOT a portability
+      # matrix and says nothing about macOS or aarch64.
+      #
+      # ubuntu-latest ships Rust (1.97.1 on the 24.04 image) and a C++ compiler, both of which
+      # build.rs needs; if that ever stops being true this job goes RED (setup.py declares the
+      # extension non-optional) rather than producing a silently slow install.
+      #
+      # Deliberately NOT under PIP_ONLY_BINARY=:all: -- that flag would refuse the sdist itself.
+      # The all-wheel DEPENDENCY policy is enforced where it belongs, in the wheels job's
+      # cibuildwheel test install; what this step exists to prove is narrower and new: that a
+      # source build off this archive produces a Rust-enabled install.
+      - name: Install the sdist and assert the Rust extension built
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/sdist-venv
+          /tmp/sdist-venv/bin/python -m pip install --upgrade pip
+          /tmp/sdist-venv/bin/pip install dist/*.tar.gz
+          /tmp/sdist-venv/bin/python -c "import cellstream; s = cellstream.rust_status(); assert s['available'], s; print(s)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          if-no-files-found: error
+          name: dist-sdist
+          path: ./dist/*.tar.gz
+
+  # A rehearsal of the upload path against a scratch index. TestPyPI is reachable ONLY from a
+  # deliberate `workflow_dispatch` with the input set, and PyPI is reachable ONLY from a pushed
+  # tag -- the two are mutually exclusive by construction, so no dispatch can ever upload a real
+  # release. `skip-existing` because a dry run is expected to be repeated.
+  #
+  # The repository guard matters MORE here than on the PyPI job, not less. TestPyPI is a public
+  # index, and an sdist built in the private development repo contains every tracked file --
+  # setuptools_scm's file finder does not know about the seed plan. A dispatch there would
+  # publish the internal trees that this whole launch exists to keep out. (codex, high.)
+  publish-testpypi:
+    name: publish to TestPyPI (dry run)
+    needs: [wheels, sdist]
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && inputs.testpypi
+      && github.repository == 'ArcInstitute/cellstream'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      # Dispatched from an UNTAGGED ref, setuptools_scm yields `0.1.devN+g<sha>` -- a PEP 440
+      # LOCAL version, which no index accepts. Say that here instead of letting the upload fail
+      # with a message about the wrong thing. Dispatch the workflow on the tag ref
+      # (`gh workflow run release.yml --ref vX.Y.Z -f testpypi=true`) to rehearse a real version.
+      - name: Refuse a local version
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          [ "${#files[@]}" -gt 0 ] || { echo "FATAL: no artifacts to publish"; exit 1; }
+          for f in "${files[@]}"; do
+            case "$(basename "$f")" in
+              *+*) echo "FATAL: $(basename "$f") carries a PEP 440 local version."
+                   echo "       Dispatch on a tag ref so setuptools_scm sees a release version."
+                   exit 1 ;;
+              *) echo "ok   $(basename "$f")" ;;
+            esac
+          done
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  # Tag/artifact validation lives in its OWN unprivileged job, ahead of the protected
+  # environment, for two reasons (codex round 2):
+  #
+  #   * the trigger pattern `v[0-9]*` still admits `v0.9`, `v0.9.0rc1` and `v0anything`. With the
+  #     check inside publish-pypi, such a tag ENTERS the `pypi` environment -- asking a human for
+  #     a deployment approval -- and only then fails. The approval prompt should mean "this is a
+  #     release", so the thing that decides that must run first.
+  #   * this job needs no `id-token: write` and no environment, so the strict check runs with no
+  #     publishing capability at all.
+  #
+  # It carries the same guards as publish-pypi. When it is SKIPPED (a dispatch, or the private
+  # development repo) publish-pypi is skipped with it, since a skipped `needs` skips the dependent
+  # job -- which is the intended behaviour in both cases.
+  validate:
+    name: validate the release tag against the artifacts
+    needs: [wheels, sdist]
+    if: >-
+      github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+      && github.repository == 'ArcInstitute/cellstream'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      # The check that ties the tag to the bytes. setuptools_scm derives the version FROM the tag,
+      # so the two agreeing is the whole premise -- but a shallow checkout, a missing tag fetch, or
+      # a tag pushed to the wrong commit all silently produce a dev version instead, and PyPI would
+      # either reject it confusingly or accept a version nobody meant to release.
+      #
+      # The tag arrives through `env:` rather than being interpolated into the script. A tag name
+      # is repository-writer-controlled text, and `${{ }}` inside `run:` is textual substitution.
+      - name: The artifacts must carry exactly the tag's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          expected="${TAG#v}"
+          echo "tag=$TAG  expected version=$expected"
+          # A release tag must name a release: X.Y.Z, no .devN, no pre/post segment, no local
+          # `+` part. Anything else is an accident that should not reach PyPI.
+          [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "FATAL: '$TAG' is not a vX.Y.Z release tag"; exit 1; }
+          shopt -s nullglob
+          files=(dist/*)
+          [ "${#files[@]}" -gt 0 ] || { echo "FATAL: no artifacts to publish"; exit 1; }
+          # Count the wheels PER INTERPRETER, not in total. `>= 2 wheels` was the first version of
+          # this check and it accepted two cp311 wheels, a stray cp310, or an aarch64 build --
+          # "two of something" is not the promised set. CIBW_BUILD is exactly `cp311-* cp312-*` on
+          # x86_64, so the promised set is exactly one of each. (codex round 3.)
+          cp311=0 cp312=0 sdists=0
+          for f in "${files[@]}"; do
+            b="$(basename "$f")"
+            case "$b" in
+              cellstream-"$expected".tar.gz) echo "ok   $b"; sdists=$((sdists + 1)) ;;
+              cellstream-"$expected"-cp311-cp311-*manylinux*x86_64.whl)
+                echo "ok   $b"; cp311=$((cp311 + 1)) ;;
+              cellstream-"$expected"-cp312-cp312-*manylinux*x86_64.whl)
+                echo "ok   $b"; cp312=$((cp312 + 1)) ;;
+              *) echo "FATAL: $b is not one of this release's promised artifacts"; exit 1 ;;
+            esac
+          done
+          # `*manylinux*x86_64` rather than a literal `manylinux_2_28_x86_64`: auditwheel chooses
+          # the tag from what the binary actually requires and can emit a compound alias, and this
+          # is not the place to bet a release on a filename nobody has read yet. The glob still
+          # rejects a bare `linux_x86_64` (unrepaired), a musllinux wheel and any non-x86_64 arch.
+          [ "$cp311" -eq 1 ] || { echo "FATAL: expected exactly 1 cp311 wheel, got $cp311"; exit 1; }
+          [ "$cp312" -eq 1 ] || { echo "FATAL: expected exactly 1 cp312 wheel, got $cp312"; exit 1; }
+          [ "$sdists" -eq 1 ] || { echo "FATAL: expected exactly 1 sdist, got $sdists"; exit 1; }
+          echo "validated: cp311 + cp312 wheels + 1 sdist, all at $expected"
+
+  publish-pypi:
+    name: publish to PyPI
+    needs: [wheels, sdist, validate]
+    # A PUSHED tag only -- see the header. The repository guard keeps this inert in the private
+    # development repo, which tags releases of its own. `validate` above carries the same guards
+    # and has already proved the tag names a release and the artifacts match it.
+    if: >-
+      github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+      && github.repository == 'ArcInstitute/cellstream'
+    runs-on: ubuntu-latest
+    # A PROTECTED environment: with a required reviewer configured, the job waits for a human
+    # before uploading. PyPI never lets a version be re-uploaded, so this pause is the only
+    # place a mistake is still recoverable.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      # No `skip-existing`: on a real release an already-present file means the tag is being
+      # re-published, and that should fail loudly rather than be shrugged off.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

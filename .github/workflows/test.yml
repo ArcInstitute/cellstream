@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes the in-flight run for the same ref. Without this, every push started
+# another full matrix while the now-obsolete runs kept going -- on a ~45 min suite that is the
+# single largest source of wasted runner time.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Rust fmt + clippy + test
+        run: |
+          cd rust
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+      - name: Install
+        run: pip install -e ".[test,cell]"
+      - name: Tests
+        run: pytest tests/ -v --ignore=tests/benchmarks
+      - name: Tests (pure-Python fallback)
+        env:
+          CELLSTREAM_DISABLE_RUST: "1"
+        # Exclude the Rust-core module: its tests re-enable Rust (delenv /
+        # subprocesses), so they belong to the Rust-present step above. This
+        # step validates the rest of the suite under the pure-Python encoder.
+        run: pytest tests/ -q --ignore=tests/benchmarks --ignore=tests/v2/test_rust_core.py
+      - name: Lint
+        run: ruff check src/ tests/

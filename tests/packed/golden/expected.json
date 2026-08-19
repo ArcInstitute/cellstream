@@ -1,0 +1,8 @@
+{
+  "n_obs": 40,
+  "n_vars": 12,
+  "nnz": 192,
+  "data_sha256": "1d15bdb4330c91b27c3abe9157592120e2b887f5065647ad4c986d303caf6221",
+  "group_GENE_A_n": 10,
+  "reference_n": 12
+}

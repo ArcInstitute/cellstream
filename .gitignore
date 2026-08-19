@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# setuptools-scm generated
+src/cellstream/_version.py
+
+# Rust extension build artefacts (compiled in-place by setuptools-rust editable installs)
+src/cellstream/v2/_rust*.so
+rust/target/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.benchmarks/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# cellstream runtime artefacts (transient; never commit)
+.cellstream.lock
+*.shardpack.lock

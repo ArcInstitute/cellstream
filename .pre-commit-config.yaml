@@ -1,0 +1,74 @@
+# Pre-commit hooks for cellstream.
+#
+# Setup (once per clone):
+#   pip install pre-commit  # or `uv pip install pre-commit`
+#   pre-commit install
+#
+# After install, `ruff check` and `ruff format` run on every `git commit`,
+# blocking the commit if there are unfixable lint errors or formatting drift.
+# Commits touching Rust sources OR the files that control how rustfmt behaves
+# — `rust/**/*.rs`, `rust/Cargo.toml`, `rustfmt.toml` / `.rustfmt.toml`, and
+# `rust-toolchain{,.toml}` (either at the repo root or under `rust/`) —
+# additionally run `cargo fmt --check`. See the hook definition below.
+#
+# Manual full-repo invocation:
+#   pre-commit run --all-files
+#
+# Ruff version is pinned to match CI's expectations; bump in lockstep with
+# the `ruff` entry in pyproject.toml's [project.optional-dependencies] dev.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.14
+    hooks:
+      # Lint pass — autofix what can be fixed, fail on anything that can't.
+      - id: ruff-check
+        args: [--fix]
+      # Formatter — keeps whitespace / line wrapping consistent across the repo.
+      - id: ruff-format
+
+  # Rust formatting. CI's first step is `cd rust && cargo fmt --check && cargo
+  # clippy … && cargo test`, and until now nothing local caught the fmt half:
+  # a commit touching only `.rs` files skipped both ruff hooks entirely
+  # ("no files to check"), so a whitespace-only slip passed pre-commit and then
+  # failed CI in ~10 s — after the ~45 min the two pytest jobs take to get there.
+  #
+  # `cargo fmt --check` is ~0.4 s, so it is cheap enough for every commit, and it
+  # is the same Cargo operation CI runs. Note this is equivalence, not a
+  # guarantee: CI installs the moving `stable` toolchain, so a contributor on a
+  # different rustfmt can still disagree with it. Neither is pinned today.
+  #
+  # `cargo clippy` is deliberately NOT here: it needs a full type-check, which is
+  # seconds-to-a-minute after any source edit, and that is too slow for a commit
+  # gate. Clippy stays a CI-only gate.
+  #
+  # This hook reports rather than rewrites (unlike ruff-format, which fixes in
+  # place): it prints the offending diff, and you fix it with
+  #     cargo fmt --manifest-path rust/Cargo.toml     (or: cd rust && cargo fmt)
+  # Note the manifest path — a bare `cargo fmt` from the repo root fails, since
+  # Cargo.toml lives under rust/. Reporting is also the safer default here:
+  # `cargo fmt` formats the whole crate, so autofixing could rewrite unrelated
+  # unstaged Rust work.
+  - repo: local
+    hooks:
+      - id: cargo-fmt-check
+        name: cargo fmt --check
+        # `--manifest-path` rather than `bash -c 'cd rust && …'`: no shell, so it
+        # works where bash is absent (native Windows), and a missing toolchain
+        # surfaces as a plain "cargo not found" instead of a shell error.
+        # `pass_filenames: false` because cargo fmt operates on the crate via
+        # Cargo.toml, not on a file list; `files:` still scopes WHEN it runs, so
+        # Python-only commits never pay for it and never need a Rust toolchain.
+        entry: cargo fmt --manifest-path rust/Cargo.toml --check
+        language: system
+        # Also the files that decide how rustfmt behaves, not just its input:
+        # Cargo.toml carries the edition, and a rustfmt/toolchain config added
+        # later would otherwise change CI's formatting with no local gate.
+        #
+        # Caveat if a toolchain file is ever added: rustup picks the toolchain
+        # from the process working directory, before cargo sees --manifest-path.
+        # pre-commit runs from the repo root but CI runs after `cd rust`, so a
+        # `rust/rust-toolchain.toml` would bind CI and NOT this hook. Put any
+        # such file at the repo root so both see it.
+        files: '^(rust/.*\.rs|rust/Cargo\.toml|(rust/)?\.?rustfmt\.toml|(rust/)?rust-toolchain(\.toml)?)$'
+        pass_filenames: false

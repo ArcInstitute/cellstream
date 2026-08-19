@@ -1,0 +1,96 @@
+[build-system]
+# setuptools>=77 is the floor for PEP 639 (`license` as an SPDX string plus
+# `license-files`). An older setuptools ERRORS on that spelling rather than warning.
+requires = ["setuptools>=77", "setuptools-scm>=8", "setuptools-rust>=1.7"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cellstream"
+description = "Compressed per-cell storage for large single-cell AnnData, built for scattered random access"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Alex Dobin" }, { name = "Arc Institute" }]
+keywords = ["single-cell", "anndata", "h5ad", "compression", "crispr", "dataloader"]
+# No `License ::` classifier: PEP 639 deprecates it, and setuptools rejects a project that
+# declares both that classifier and the `license` field above.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    # Wheels are Linux x86_64 only; other platforms build from the sdist. See release.yml.
+    "Operating System :: POSIX :: Linux",
+]
+dynamic = ["version"]
+dependencies = [
+    "anndata>=0.10",
+    "h5py>=3.9",
+    "hdf5plugin>=6.0",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "pyarrow>=14",
+    "bitshuffle>=0.5,<1.0",
+    "zstandard>=0.22",
+]
+
+[project.urls]
+Homepage = "https://github.com/ArcInstitute/cellstream"
+Repository = "https://github.com/ArcInstitute/cellstream"
+Issues = "https://github.com/ArcInstitute/cellstream/issues"
+Changelog = "https://github.com/ArcInstitute/cellstream/blob/main/CHANGELOG.md"
+"Format specification" = "https://github.com/ArcInstitute/cellstream/blob/main/docs/format.md"
+
+[project.scripts]
+cellstream = "cellstream.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-benchmark", "ruff>=0.5"]
+dev  = ["pytest>=7", "pytest-benchmark", "ruff>=0.5", "mypy>=1.10"]
+gpu = [
+    "cupy-cuda12x>=13",
+    "nvidia-nvcomp-cu12>=4.0,<5.0",
+]
+mudata = ["mudata>=0.2"]
+# Only the PURE-PYTHON pfordelta codec needs pyfastpfor: the Rust extension carries its own
+# vendored FastPFor and never calls it. So layout="cell" works out of the box from a wheel,
+# and this extra is for the fallback engine (CELLSTREAM_DISABLE_RUST=1). Kept an extra rather
+# than a dependency because pyfastpfor has no linux wheel of its own -- installing it compiles
+# C++, which no ordinary install should have to do.
+#
+# NOT a fix for "a platform with no wheel", which an earlier version of this comment claimed:
+# pyfastpfor binds the SAME x86 FastPFor, so on aarch64 it is not a pfordelta backend at all.
+# The zstd pure-Python path needs nothing extra -- `_import_pyfastpfor` is called only from the
+# pfordelta encoder/decoder. (codex round 3.)
+cell = ["pyfastpfor>=1.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"cellstream.v2.kernels" = ["*.cu"]
+
+[tool.setuptools_scm]
+write_to = "src/cellstream/_version.py"
+
+[tool.pytest.ini_options]
+# Scope default collection to tests/, so a bare `pytest` from the repo root runs the
+# suite and only the suite. Explicit paths still override it.
+testpaths = ["tests"]
+# Make the repo root importable so tests/v2/test_dispatcher.py can do
+# `from tests.v2.test_reader_cpu import _hand_build_v2_archive` (a helper
+# shared across two test modules). Without this, CI fails with
+# `ModuleNotFoundError: No module named 'tests'`.
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]
