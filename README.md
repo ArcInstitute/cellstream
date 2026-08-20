@@ -69,7 +69,7 @@ configuration this release claims — see
 
 ```bash
 cellstream runtime
-# cellstream 0.9.0 | rust=yes | extension present and enabled
+# cellstream 0.9.1 | rust=yes | extension present and enabled
 ```
 
 **conda / mamba** — create the environment with conda/mamba, then install cellstream with pip; all
@@ -111,8 +111,16 @@ rather than assume:
 grep -q sse4_1 /proc/cpuinfo && echo "SSE4.1: yes" || echo "SSE4.1: NO — the wheels will fault"
 ```
 
-Where no wheel is published for your platform, `pip install cellstream` falls back to the sdist and
-builds from source. Note what that does **not** buy you: a wheel tag cannot express an ISA
+On a supported Python (3.11 or 3.12), where no wheel is published for your platform,
+`pip install cellstream` falls back to the sdist and builds from source.
+
+**On 3.13 there is no supported version — and `pip install cellstream` does not simply fail.**
+0.9.1's `requires-python` excludes 3.13, so an unpinned install backtracks to an older release
+that still accepts it: 0.9.0, or behind it the 0.0.1 name placeholder, unless those have been
+yanked. Whatever lands there is unsupported — see the CHANGELOG's 0.9.1 entry for what goes wrong.
+`pip install cellstream==0.9.1` on 3.13 fails outright, which is the intended behaviour.
+
+Note what a source build does **not** buy you: a wheel tag cannot express an ISA
 requirement, so on an x86_64 machine without SSE4.1 pip takes the *wheel* and the fault above still
 applies — and forcing a source build would not help either, since `rust/build.rs` compiles with
 `-msse4.1` regardless. Building from source lowers the glibc floor, not the ISA floor.
@@ -470,7 +478,7 @@ gates CI enforces (`pre-commit` is not one of the extras). The test
 suite runs under both engines — the Rust core and, with `CELLSTREAM_DISABLE_RUST=1`, the pure-Python
 fallback — and a change to either path is expected to keep both green.
 
-This is the first public release of a package with a substantial private development history, so
+cellstream first became public in 0.9.0, after a substantial private development history, so
 expect open ends: the per-cell format is marked experimental for a reason, and correctness work on
 the layout continues. Bug reports with a reproducing archive are the most useful thing you can send.
 

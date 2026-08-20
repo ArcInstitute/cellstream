@@ -4,6 +4,52 @@ All notable changes to **cellstream** are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-08-19
+
+### Fixed
+
+- **`requires-python` now excludes CPython 3.13** (`>=3.11,<3.13`). 0.9.0 declared `>=3.11`, so
+  pip installed it on 3.13 -- where both this package and `bitshuffle` build from source,
+  `import cellstream` succeeds, and `cellstream runtime` reports
+  `rust=yes | extension present and enabled`. The test suite then fails **non-deterministically**:
+  three runs on 3.13 each failed a different one or two tests, every one of which passes in
+  isolation. Two shared a signature in the per-cell write path --
+  `ValueError: reorder_frames: in_offsets[-1]=… != staging file size …`, the staged file's size
+  disagreeing with the offsets the encoder had accumulated -- and a third run failed in an
+  unrelated subsystem, so it is not confined to that path. **The root cause is not diagnosed.**
+
+  One failure seen in that third run has been *excluded* from this evidence rather than counted:
+  `tests/test_out_of_shm.py` asserts on machine-global `/dev/shm` state, and it fails from
+  contention with any other process on the same machine. It failed identically on **3.12**, and
+  passes in isolation on both, so it is environmental and says nothing about 3.13.
+
+  The resolved dependency *versions* do not explain it, which was checked rather than assumed:
+  CPython **3.12** with the *identical* resolved stack (pandas 3.0.5, anndata 0.13.2, numpy 2.5.2,
+  scipy 1.18.0) runs the per-cell suite clean, and so does 3.11 both from the published wheel and
+  from a source build of this package's sdist. One difference is **not** controlled: 3.12 installed
+  `bitshuffle` from a wheel, while 3.13 has none and had to build its sdist -- and a build that
+  succeeds does not by itself establish runtime correctness. So the supportable statement is
+  narrower than "it is 3.13": the failures have been observed only in the 3.13 environments
+  tested, and the resolved dependency versions do not account for them.
+
+  A package that installs, imports, and reports a working native extension before intermittently
+  failing a write is the wrong thing to leave installable. Nothing changes for 3.11 or 3.12, and
+  support can return once the failures are understood -- this is a deliberate stop, not a claim
+  that 3.13 is unsupportable.
+
+  **What this bound does and does not do.** Compatibility metadata is per release, so it applies to
+  0.9.1 alone. An unpinned `pip install cellstream` on 3.13 skips 0.9.1 and backtracks to whatever
+  older release still accepts 3.13: 0.9.0 (`>=3.11`), and behind that the 0.0.1 name placeholder
+  (`>=3.10`), which contains no working code. Making a 3.13 install fail outright therefore takes
+  yanking those as well; until then, an unpinned install on 3.13 still resolves to 0.9.0.
+  `pip install cellstream==0.9.1` on 3.13 fails immediately, which is the intended behaviour.
+
+### Changed
+
+- The *Known limitations* note on CPython 3.13 claimed it was blocked "on a dependency ... rather
+  than on anything in this package". **That claim was incorrect when written**, not merely
+  outdated, and has been corrected in place.
+
 ## [0.9.0] — 2026-08-19
 
 **First public release.** cellstream has a substantial development history in a private
@@ -84,8 +130,12 @@ placeholder was uploaded to PyPI in July 2026 to reserve the name and contains n
     extra; **pfordelta** — the default for integer counts — does not, because its pure-Python path
     needs `pyfastpfor`, itself a binding to the same x86 FastPFor.
   - **Windows:** `import cellstream` fails — `cellstream/lock.py` imports `fcntl` at module scope.
-  - **CPython 3.13** is blocked on a dependency (`bitshuffle` publishes no cp313 wheel) rather
-    than on anything in this package.
+  - **CPython 3.13** is not supported. This entry originally said it was blocked "on a dependency
+    (`bitshuffle` publishes no cp313 wheel) rather than on anything in this package", which was
+    incorrect: bitshuffle's sdist builds on 3.13, as does this package's, and the result imports
+    and reports a working Rust extension. The real blocker is that the suite then fails
+    non-deterministically -- see the 0.9.1 entry. Note that **0.9.0's own `requires-python` does
+    not exclude 3.13**; 0.9.1 is the release that does.
   Making aarch64 or Windows work is ordinary future work, not a packaging switch.
 - **`layout="shard"` is legacy and unsupported.** It remains the `write_sharded` default for
   backwards compatibility, still ships, still imports and is still tested, but it is not
@@ -93,4 +143,5 @@ placeholder was uploaded to PyPI in July 2026 to reserve the name and contains n
   (`mudata`) reads belong to that layout, not to the per-cell store.
 - **`.layers` and `.raw` are not stored** by the per-cell layout.
 
+[0.9.1]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.1
 [0.9.0]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.0

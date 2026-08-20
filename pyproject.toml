@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 name = "cellstream"
 description = "Compressed per-cell storage for large single-cell AnnData, built for scattered random access"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Alex Dobin" }, { name = "Arc Institute" }]

@@ -59,13 +59,20 @@ name: release
 # reads are much slower with no indication: setup.py declares the extension non-optional, so a
 # missing toolchain FAILS LOUDLY (#244).
 #
-# cp313 is deliberately ABSENT: `bitshuffle` (a required dependency) has no cp313 wheel, so a
-# cp313 build could not offer an ALL-WHEEL dependency install -- it would force an unverified
-# native source build of bitshuffle on every user. (Not strictly impossible; bitshuffle's sdist
-# declares >=3.9.) Unblocking 3.13 needs CODE, not just metadata: cell/codec.py imports
-# v2/codec.py, which does `import bitshuffle` unconditionally at module scope, so
-# `import cellstream` reaches it even on the cell path. Lazy-import it inside the legacy
-# bitshuffle encode/decode functions first, then bitshuffle can become an extra. (#305)
+# cp313 is deliberately ABSENT, and as of 0.9.1 `requires-python` excludes it outright. The
+# original reason recorded here -- that `bitshuffle` has no cp313 wheel, so a cp313 build could
+# not offer an ALL-WHEEL dependency install -- is TRUE but is NOT the blocker. Measured 2026-08-19:
+# both bitshuffle's sdist and this package's sdist build on 3.13, `import cellstream` succeeds and
+# `cellstream runtime` reports rust=yes. The suite then fails NON-DETERMINISTICALLY there: three
+# runs, different tests each time, each passing in isolation, two sharing a per-cell write-path
+# signature (`reorder_frames: in_offsets[-1] != staging file size`). Root cause undiagnosed; the
+# resolved dependency versions are ruled out (3.12 with the identical stack is clean) but
+# bitshuffle-from-sdist vs bitshuffle-from-wheel is not. Supporting cp313 therefore needs TWO
+# things and neither is sufficient alone: (a) those failures understood, and (b) an all-wheel
+# cp313 install, which needs #305's move-to-an-extra, an upstream cp313 bitshuffle wheel, or
+# relaxing the PIP_ONLY_BINARY=:all: policy below. #305 may well bear on (a) too, not just (b):
+# lazy-importing bitshuffle removes the very source build that is currently the uncontrolled
+# variable. What is NOT true is the original claim that the missing wheel is the blocker. (#305)
 #
 # --- why the build platform is manylinux_2_28 (#297) ---
 # This workflow had never once succeeded before #304. It always died in cibuildwheel's
@@ -222,10 +229,10 @@ jobs:
           grep -qE '/rust/vendor/.+\.(h|hpp|cpp|cc)$' /tmp/sdist.list \
             || { echo "FATAL: sdist carries no vendored FastPFor sources"; exit 1; }
           echo "sdist contents OK ($(wc -l < /tmp/sdist.list) members)"
-      # The sdist is what a non-wheel platform actually gets, and this is the first release that
-      # ships one, so install it the way they will. SCOPE: one configuration -- Ubuntu, cp311,
-      # x86_64. It proves the archive builds a Rust-enabled install; it is NOT a portability
-      # matrix and says nothing about macOS or aarch64.
+      # The sdist is what a non-wheel platform actually gets, so install it the way they will.
+      # SCOPE: one configuration -- Ubuntu, cp311, x86_64. It proves the archive builds a
+      # Rust-enabled install; it is NOT a portability matrix and says nothing about macOS or
+      # aarch64.
       #
       # ubuntu-latest ships Rust (1.97.1 on the 24.04 image) and a C++ compiler, both of which
       # build.rs needs; if that ever stops being true this job goes RED (setup.py declares the
@@ -275,8 +282,11 @@ jobs:
           merge-multiple: true
           path: dist
       - run: ls -l dist
-      # Dispatched from an UNTAGGED ref, setuptools_scm yields `0.1.devN+g<sha>` -- a PEP 440
-      # LOCAL version, which no index accepts. Say that here instead of letting the upload fail
+      # Dispatched from an UNTAGGED ref, setuptools_scm yields a `.devN+g<sha>` LOCAL version
+      # (PEP 440), which PyPI and TestPyPI both reject (a private index may not). The exact
+      # string depends on the most recent tag -- it was `0.1.devN+g<sha>` before the first tag
+      # existed and derives from the latest release now -- but the `+` local segment is what
+      # makes it unpublishable either way. Say that here instead of letting the upload fail
       # with a message about the wrong thing. Dispatch the workflow on the tag ref
       # (`gh workflow run release.yml --ref vX.Y.Z -f testpypi=true`) to rehearse a real version.
       - name: Refuse a local version
