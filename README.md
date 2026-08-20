@@ -108,26 +108,29 @@ K10 / Phenom II line has SSE4a instead, and AMD gained SSE4.1 only with Bulldoze
 rather than assume:
 
 ```bash
+# Linux
 grep -q sse4_1 /proc/cpuinfo && echo "SSE4.1: yes" || echo "SSE4.1: NO — the wheels will fault"
+# macOS (there is no /proc, so the Linux form above reports a false NO)
+sysctl machdep.cpu.features 2>/dev/null | grep -qi 'sse4\.1' && echo "SSE4.1: yes" || echo "SSE4.1: NO"
 ```
 
 On a supported Python (3.11 or 3.12), where no wheel is published for your platform,
 `pip install cellstream` falls back to the sdist and builds from source.
 
-**On 3.13 there is no supported version — and `pip install cellstream` does not simply fail.**
-0.9.1's `requires-python` excludes 3.13, so an unpinned install backtracks to an older release
-that still accepts it: 0.9.0, or behind it the 0.0.1 name placeholder, unless those have been
-yanked. Whatever lands there is unsupported — see the CHANGELOG's 0.9.1 entry for what goes wrong.
-`pip install cellstream==0.9.1` on 3.13 fails outright, which is the intended behaviour.
+**On 3.13 the install fails, which is the intended behaviour.** 0.9.1's `requires-python`
+excludes 3.13, and the two older releases that would otherwise accept it — 0.9.0 and the 0.0.1
+name placeholder — are both yanked, so a resolver has nothing to fall back to. See the CHANGELOG's
+0.9.1 entry for what goes wrong there. A yank is a soft signal, so an *exact* pin such as
+`pip install cellstream==0.9.0` still installs; that is unsupported.
 
 Note what a source build does **not** buy you: a wheel tag cannot express an ISA
 requirement, so on an x86_64 machine without SSE4.1 pip takes the *wheel* and the fault above still
 applies — and forcing a source build would not help either, since `rust/build.rs` compiles with
 `-msse4.1` regardless. Building from source lowers the glibc floor, not the ISA floor.
 
-That build needs **two** toolchains present at install time — Rust, from [rustup.rs](https://rustup.rs) or
-conda-forge, **and a C++11 compiler**, because `rust/build.rs` drives `cc` over the vendored
-FastPFor sources. Both, not just Rust:
+That build, **on x86_64**, needs **two** toolchains present at install time — Rust, from
+[rustup.rs](https://rustup.rs) or conda-forge, **and a C++11 compiler**, because `rust/build.rs`
+drives `cc` over the vendored FastPFor sources. Both, not just Rust:
 
 ```bash
 mamba install -c conda-forge rust cxx-compiler
@@ -145,8 +148,9 @@ than leaving you to discover them:
 
 | platform | state |
 |---|---|
-| Linux or macOS **x86_64 with SSE4.1** | **Works.** The sdist builds the full Rust core. CI builds the sdist, installs it on Linux/CPython 3.11 and asserts the extension is present and complete; the full suite runs against a source checkout on 3.11 and 3.12 under both engines. macOS is not in CI. |
-| **aarch64**, including Apple Silicon | **Unsupported.** The crate compiles, but the per-cell code path does not exist there: `rust/src/cell.rs` is `#![cfg(target_arch = "x86_64")]`, because the vendored FastPFor is x86 SIMD. So `rust_available()` is `False` and a per-cell read raises unless you set `CELLSTREAM_ALLOW_PYTHON_FALLBACK=1`. With that opt-in, a **zstd** archive does decode in pure Python and needs no extra — but **pfordelta**, the default codec for integer counts, has no working backend: its pure-Python path needs `pyfastpfor`, which is itself a binding to the same x86 FastPFor. |
+| Linux **x86_64 with SSE4.1** | **Works.** The sdist builds the full Rust core. CI builds the sdist, installs it on Linux/CPython 3.11 and asserts the extension is present and complete; the full suite runs against a source checkout on 3.11 and 3.12 under both engines. |
+| macOS **x86_64 with SSE4.1** | **Expected to work, untested.** The extension is x86_64-gated, not Linux-gated, so the same code path applies — but there is no macOS job anywhere in CI, and the sdist test above says nothing about macOS. |
+| **aarch64**, including Apple Silicon | **Unsupported.** The crate compiles, but the per-cell code path does not exist there: `rust/src/cell.rs` is `#![cfg(target_arch = "x86_64")]`, because the vendored FastPFor is x86 SIMD. So `cellstream.rust_available()` is `False` and a per-cell read raises unless you set `CELLSTREAM_ALLOW_PYTHON_FALLBACK=1`. With that opt-in, a **zstd** archive does decode in pure Python and needs no extra — but **pfordelta**, the default codec for integer counts, has no working backend: its pure-Python path needs `pyfastpfor`, which is itself a binding to the same x86 FastPFor. |
 | **Windows** | **Unsupported**, and not merely untested: `import cellstream` fails outright, because `cellstream/lock.py` imports `fcntl` at module scope. |
 
 **Development install**
@@ -388,10 +392,11 @@ container.
    values. There is **no zstd stage** on this path — the frame-of-reference delta coding is where
    the compression comes from. Genuine floats use a separate **zstd** codec with a byte-plane
    filter, because byte-shuffling float values destroys the whole-value repeats zstd exploits. Each
-   archive self-describes: `manifest["codec"]` and `manifest["schema_version"]` name the codec for
-   the whole archive — there is deliberately **no per-frame marker**, since a per-row tag would
-   cost bytes on every cell to express something uniform — and a reader that does not recognize
-   the name **raises** rather than guessing, so the format is forward-safe.
+   archive self-describes, archive-wide: `manifest["codec"]` names the codec and
+   `manifest["schema_version"]` the schema version, and the two must agree (5 ⇒ `pfordelta`,
+   6 ⇒ `zstd`). There is deliberately **no per-frame marker**, since a per-row tag would cost bytes
+   on every cell to express something uniform, and a reader that does not recognize either value
+   **raises** rather than guessing, so the format is forward-safe.
 
 3. **Native encode and decode.** Both directions run through a Rust core that vendors FastPFor and
    decodes across worker threads straight into the output buffer. The pure-Python fallback is

@@ -1,0 +1,88 @@
+cellstream — authors and contributors
+=====================================
+
+Issue and pull-request numbers refer to the private development repository this tree was
+seeded from. They are not numbers in this repository, and the public `CHANGELOG.md` begins at
+0.9.0, so they cannot be looked up here.
+
+Maintainer
+----------
+
+Alexander Dobin (@alexdobin)
+    Author and maintainer.
+
+
+Reviewed, reported and diagnosed
+--------------------------------
+
+Nick Youngblut (@nick-youngblut)
+    0.6.3 — the codec-selection scan was the dominant write cost (#216). His review named
+    it; measurement confirmed it at 6.5 B nnz, where scanning every value to choose
+    integer-vs-float storage was ~86% of a write. The writer now encodes optimistically as the
+    integer codec and re-encodes only on `NonIntegerCountsError`: pfordelta 146.8 s → 17.1 s,
+    zstd 143.7 s → 19.9 s, peak RSS −32 GB, with `payload_sha256` unchanged.
+
+    0.6.3 — the two engines disagreed on a rejected cast (#228, closing the Python facet of
+    #174). His review caught that the Rust core raised `ValueError` where pure Python raised
+    `LossyCastError` for the same refused narrowing — both refused, so only the type differed.
+    The underlying defect was a reader judging cast-safety from the untrusted manifest and
+    then doing a plain `astype` with no per-element check — a tampered footer claiming
+    `x_data_dtype_min="uint16"` over an always-uint32 stream silently truncated 70000 to 4464.
+
+    0.7.0 — a coalesced flush blamed the wrong input (reviewing PR #230). Once writes are
+    coalesced, a validation rejection surfaces at the flush rather than at the `add_block()`
+    that supplied the bad rows, so the error named nothing the caller could act on. It now names
+    the buffered add-order row span. (The other hardening in that release, the
+    `concat_cell_archives` identity fast-path, is not his — it came from the automated
+    reviewers on the same pull request.)
+
+    0.7.1 — an ungrouped write did full reindex work to reproduce its own input (#242,
+    closing #240 and #241), from his review of #232 / #238. An ungrouped write
+    (`group_by=None`) resolves to an identity permutation rather than `None`, while the
+    short-circuit tested `perm is None` — so a write carrying non-empty `obsp` ran the
+    whole both-axes `obsp[perm, :][:, perm]` reindex, plus a per-entry `obsm` row copy, to
+    arrive back at exactly what it started with. Byte-identical archives before and after.
+    The same review produced the second half of that change (#241): the flush diagnostic
+    blamed the data for what were environment failures — `MemoryError`, a threading
+    `RuntimeError` — which now get only the positional span.
+
+    0.3.0 — the uint16 narrowing trick. The README section documenting it credits him for
+    the trick itself.
+
+Tiffany Chu (@tiffanyformosa)
+    Filed #229 — a `layout="cell"` archive stored `X` with `obs`/`var`/`uns` but warned and
+    dropped `obsm`, `varm`, `obsp` and `varp`, which the shard layout already kept — with a
+    written description of the gap attached rather than a one-line request, including the
+    observation that none of them needs sharding yet and what would change that (denser
+    `obsm`, e.g. k-nearest-neighbours at k ≫ 10). It shipped in 0.7.0 as the `layout="cell"`
+    annotation-matrix support, 0.7.1 fixed a defect in it (#240), and `concat_cell_archives` was
+    then taught to preserve the same matrices. The request is also what surfaced the deeper
+    limitation those matrices still have — they live in one `header.h5ad` member with no partial
+    read — which is now tracked as #262.
+
+Jeremy Sullivan (@sullivanj91)
+    The archive extension — a caller convention, never enforced: an archive is identified by its
+    container magic and manifest — is `.csad` rather than `.csa` because of his point on PR
+    #215: the `ad` in `shardad` communicated that the format is a variant of `h5ad`, and
+    dropping it in the rename would throw that away. The design spec had proposed `.csa`
+    ("CellStream Archive"); it now reads `.csad` ("CellStream AnnData archive").
+
+
+AI agents
+---------
+
+Much of this codebase was written with Claude Code (Anthropic), and OpenAI Codex was used inside
+those same sessions to review the work before it reached human review — a deliberate
+cross-provider check, on the theory that a second model from a second vendor is harder to talk
+into agreement than the one that wrote the code. On top of that, Gemini Code Assist is the
+configured default reviewer on every pull request, with GitHub Copilot requested as well — as a
+fallback in the automation, and in practice on most rounds.
+
+Design decisions, rulings and acceptance of every change are the maintainer's and contributors'.
+
+
+Copyright
+---------
+
+Copyright (c) 2026 Arc Research Institute.
+MIT — see LICENSE.

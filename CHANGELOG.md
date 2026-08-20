@@ -38,11 +38,12 @@ All notable changes to **cellstream** are documented here. The format is based o
   that 3.13 is unsupportable.
 
   **What this bound does and does not do.** Compatibility metadata is per release, so it applies to
-  0.9.1 alone. An unpinned `pip install cellstream` on 3.13 skips 0.9.1 and backtracks to whatever
-  older release still accepts 3.13: 0.9.0 (`>=3.11`), and behind that the 0.0.1 name placeholder
-  (`>=3.10`), which contains no working code. Making a 3.13 install fail outright therefore takes
-  yanking those as well; until then, an unpinned install on 3.13 still resolves to 0.9.0.
-  `pip install cellstream==0.9.1` on 3.13 fails immediately, which is the intended behaviour.
+  0.9.1 alone. On its own that only makes 3.13 skip 0.9.1 and backtrack to whatever older release
+  still accepts 3.13: 0.9.0 (`>=3.11`), and behind that the 0.0.1 name placeholder (`>=3.10`),
+  which contains no working code. **Both have therefore been yanked**, so a 3.13 resolver now has
+  nothing to fall back to and an unpinned `pip install cellstream` there fails outright, which is
+  the intended behaviour. A yank is a soft signal rather than a deletion: an *exact* pin such as
+  `pip install cellstream==0.9.0` still installs, and is unsupported.
 
 ### Changed
 
