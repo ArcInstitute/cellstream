@@ -4,6 +4,79 @@ All notable changes to **cellstream** are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A path `stat()` is no longer used to decide how many bytes are on disk.** On a filesystem that
+  caches file attributes -- a distributed filesystem such as WekaFS, or NFS -- `stat(path)` can
+  report a stale-SHORT `st_size` immediately after an append through a different fd, while `fstat`
+  on an open fd, `lseek(SEEK_END)` and the bytes themselves are all already correct. No data is
+  lost; only the cached attribute lags, and it settles within a fraction of a second.
+
+  Eight call sites sized a file that way. Seven now measure through an fd rather than the path, and
+  the eighth derives its number from the write it just performed. Three of them -- the storage-order
+  step in Rust, the archive-open trailer check and the tail backup -- size and read through ONE
+  handle, so for those the path cannot be swapped in between; the rest close the fd again. What the
+  change buys everywhere is a size that is not a stale cached attribute, which is the whole bug. It
+  is not a claim about a concurrent writer on the same inode.
+
+  - the per-cell writer's storage-order step, both on its identity fast-path and in
+    `reorder_frames` on both engines. This is where the `reorder_frames: in_offsets[-1] != staging
+    file size` failures described under 0.9.1 came from: the staging file was intact and complete,
+    and the guard was reading a stale size for it.
+  - the push writer's rollback point after a rejected block. A stale-short value truncated away
+    bytes belonging to blocks written EARLIER, so one rejected block could destroy a long, healthy
+    push write rather than only itself.
+  - the packed writer's member length, which went into the archive footer while the copy loop wrote
+    the whole file regardless. A stale-short value recorded a member SHORTER than the bytes present
+    -- an archive that reported a successful write and was wrong on disk. Both the per-cell and the
+    sharded layout go through this packer.
+  - the in-place tail-edit backup, where a stale-short size backed up a truncated tail, and the
+    archive-open trailer check, where it made a perfectly good, freshly written archive look
+    invalid.
+
+  The guards themselves are unchanged: a genuinely wrong offset table still fails loudly. All seven
+  Python sites have regression tests that inject the divergence directly -- `os.stat` short,
+  `os.fstat` truthful -- so they run anywhere, including on the local disks CI uses, where the real
+  staleness never occurs. The Rust site cannot be injected from Python; it is covered by its
+  existing corrupt-input tests plus verification against a real distributed filesystem.
+
+- **`MatrixSpec.__eq__` returns a bool again on CPython 3.13.** 3.13 generates a pairwise field
+  comparison for dataclasses instead of comparing the two field tuples, which loses the identity
+  shortcut and the bool coercion that `PyObject_RichCompareBool` provided -- so with a sparse
+  matrix or a DataFrame in a field, `==` returned the elementwise result instead of `True`, and
+  anything asking for its truth value raised. Present in 0.9.0 and 0.9.1. This is the "failure in
+  an unrelated subsystem" mentioned under 0.9.1, and it is unrelated to the write path.
+
+- **Two error messages no longer point at a repository you cannot reach.** Opening a legacy
+  v1/directory archive, and passing `format="v1"` to `write_sharded`, both answered with a
+  `pip install` of a git URL for this project's pre-rename repository at tag v0.4.0. That
+  instruction could not work for anyone reading it: the repository is not public, and v0.4.0 was
+  never uploaded to PyPI either. Both messages now say what is true instead -- no installable
+  release can read such an archive, so re-encode from the original source data with the current
+  writer -- and `PackedOnlyError`'s docstring no longer promises an install command it does not
+  carry. The release tooling gained a check that refuses to publish if a non-public repository URL
+  reappears in a shipped file, including one a Python source file assembles from adjacent string
+  literals so that no single line contains it.
+
+### Changed
+
+- **The CPython 3.13 exclusion is lifted; `requires-python` is `>=3.11` again.** 0.9.1's cap rested
+  on the intermittent write failures above being a 3.13 defect. They were not: with the dependency
+  stack held constant and 1500 writes per version, **3.11 failed 20 times, 3.12 8 and 3.13 12, and
+  a local disk zero times on every version** -- 3.11 was the worst arm. Two clean 3.11/3.12 runs at
+  roughly one failure per thousand tests were luck, not a control.
+
+  3.13 has no `bitshuffle` wheel, so installing there builds that sdist; that is a build cost, not
+  a failure. **CI now runs 3.11, 3.12 and 3.13** and the classifiers claim all three; the published
+  **wheels** stay cp311/cp312, which is a distribution fact rather than a support one.
+
+  **The yanks on 0.9.0 and the 0.0.1 placeholder stay**, for a better reason than the one they were
+  applied for: every *functional* release before this fix carries the stale-`stat()` bug on a
+  distributed filesystem, whatever the Python version. (0.0.1 is a name placeholder with no
+  working code, so it stays yanked for being unusable rather than for the bug.)
+
 ## [0.9.1] — 2026-08-19
 
 ### Fixed

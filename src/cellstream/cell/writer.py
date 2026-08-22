@@ -81,6 +81,44 @@ def _default_encode_threads(n_tasks: int) -> int:
     return max(1, min(n, n_tasks))
 
 
+def _file_size(path) -> int:
+    """Bytes on disk, measured through an OPEN FD -- never a path ``stat()`` (#305).
+
+    On an attribute-caching network filesystem -- WekaFS, which backs every Arc store, and NFS --
+    ``stat(path)`` can report a stale-SHORT ``st_size`` immediately after an append through a
+    different fd, while ``fstat`` on an open fd, ``lseek(SEEK_END)`` and the bytes themselves are
+    all already correct. No bytes are lost; only the cached attribute lags, and it settles within a
+    fraction of a second.
+
+    Sizing a staging file with a path stat therefore REJECTED perfectly good writes: 20 of 1500
+    ``CellArchiveWriter`` writes on Python 3.11 + wekafs, 8 on 3.12, 12 on 3.13, and 0 of 1500 on
+    local ext4 for every version -- which is why those failures were misread as a CPython 3.13
+    defect. Opening the file is also what refreshes the attribute, so this is the honest
+    measurement rather than a retry.
+
+    ⚠️ This helper carries NO time-of-check guarantee: the fd is closed again on return, so whatever
+    the caller does next is a fresh lookup. Three of the eight sites in this fix DO size and read
+    through one handle -- Rust's ``reorder_frames``, ``packed.reader._trailer_valid`` and
+    ``_update_metadata_packed``'s tail backup -- and there the path cannot be swapped between the
+    two operations; even those are not protected against a concurrent writer mutating the same
+    inode. What this helper buys is a size that is not a stale cached attribute. That is the whole
+    bug, and it is all it buys. (codex, checkpoint 2 rounds 1-2.)
+
+    ``tests/_stale_stat.py`` injects that exact divergence (``os.stat`` short, ``os.fstat``
+    truthful) so the callers are covered on any filesystem, CI's local disk included.
+
+    ``os.fstat`` and ``lseek(SEEK_END)`` are equally immune (verified: both correct in all 26
+    observed mismatches), so the choice between them follows one rule in this codebase -- **fstat
+    when the handle is only being measured, seek when it is also being read from.** `_file_size` and
+    ``packed.reader._apply_recovery`` measure and close, so they fstat and leave the file position
+    alone; ``_trailer_valid`` and ``_update_metadata_packed``'s tail backup have to move the position
+    anyway, so they seek and spend no second call. (Gemini suggested seek in both places; the mix is
+    deliberate, not drift.)
+    """
+    with open(path, "rb") as fh:
+        return os.fstat(fh.fileno()).st_size
+
+
 def _validate_in_offsets(in_offsets, staged_size, *, n_obs=None):
     """Canonical in_offsets guards, shared by _reorder_frames_python and _reorder_and_finalize's
     identity fast-path (which skips reorder_frames and so would otherwise skip these). The three
@@ -194,7 +232,7 @@ def _reorder_frames_python(staging_path, out_path, in_offsets, perm):
     guards ("perm length", "out of range") stay here."""
     in_offsets = np.asarray(in_offsets, dtype=np.int64)
     perm = np.asarray(perm, dtype=np.int64)
-    staged = os.path.getsize(staging_path)
+    staged = _file_size(staging_path)
     _validate_in_offsets(in_offsets, staged)
     n_src = in_offsets.size - 1
     # perm must define a full reorder of every source frame -- a shorter perm silently drops
@@ -1136,7 +1174,7 @@ def _reorder_and_finalize(
         # corrupt offsets sidecar (non-monotonic / not starting at 0 / wrong length / truncated
         # payload) fails loud instead of byte-copying into a broken archive. n_obs pins the frame
         # count the identity path can't get from reorder_frames' perm-length check.
-        staged_len = Path(staging).stat().st_size
+        staged_len = _file_size(staging)
         _validate_in_offsets(in_offsets, staged_len, n_obs=n)
         if Path(staging) != payload:
             os.replace(staging, payload)

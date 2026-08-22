@@ -60,9 +60,8 @@ def _csr_direct_assign(
     """Assemble a CSR by empty-construct + direct ``.data/.indices/.indptr``
     assignment, skipping scipy ``check_format``'s O(nnz) scan (column-index
     bounds + sortedness + dtype coercion) on the hot bulk-read path. On a
-    multi-billion-nnz archive that scan costs ~10 s (see
-    scratch/cell_validation/DECODE_PROFILE_FINDINGS.md); this mirrors the v2
-    shard reader (read.py) which bypasses it the same way.
+    multi-billion-nnz archive that scan costs ~10 s; this mirrors the v2 shard
+    reader (read.py) which bypasses it the same way.
 
     Structural integrity is re-checked cheaply here as defense-in-depth against
     a corrupt archive:

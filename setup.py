@@ -34,7 +34,7 @@ setup(
             # slower per thread on the encode hot path — the cause of the spurious "Rust
             # 0.041 GB/s vs Python 0.30" benchmark (a debug `.so`; release ~0.44 GB/s/thread,
             # above Python). Wheels / `pip install .` were already release; this makes dev and
-            # bench installs match. See scratch/v2_write_perf/RUST_ENCODE_PERF_FINDINGS.md.
+            # bench installs match.
             debug=False,
         )
     ]

@@ -20,6 +20,7 @@ from . import format as fmt
 from .codec import _import_pyfastpfor, codec_for
 from .writer import (
     _default_encode_threads,
+    _file_size,
     _reorder_and_finalize,
     _resolve_push_codec,
     _stream_encode_block_python,
@@ -248,7 +249,10 @@ class CellArchiveWriter:
         # Engine-agnostic on purpose: a no-op on the Rust arm (which encodes into per-worker
         # .partN files and concatenates only on success), and writing it once is what makes the
         # two arms observably identical -- the parity contract _validate_col_indices states below.
-        mark = self._staging.stat().st_size
+        # Through an fd, never a path stat: a stale-short mark would truncate away bytes
+        # belonging to blocks flushed EARLIER that are still counted in _frame_lens, killing
+        # a good push write instead of only discarding the block that failed (#305).
+        mark = _file_size(self._staging)
         snap = (
             len(self._frame_lens),
             len(self._row_nnz),
@@ -629,7 +633,6 @@ def concat_cell_archives(
     """Merge N self-describing cell archives into one canonical archive by BYTE-COPYING frames --
     no decode, no re-encode. Group/sort params default to the parts' manifests (must agree).
     Peak RAM O(block)+O(n_obs), plus the annotation cost below when annotations are preserved.
-    See docs/superpowers/specs/2026-07-18-222-...md.
 
     The output is committed atomically, same as ``CellArchiveWriter.finalize``: nothing under
     ``out`` exists until the final ``pack()`` (inside the shared ``_reorder_and_finalize`` tail)

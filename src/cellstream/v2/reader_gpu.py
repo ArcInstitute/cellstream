@@ -3,8 +3,7 @@
 Decodes ONE shard at a time. Reads cellstream's standard libzstd-1 frames as-is via
 nvCOMP RAW bitstream (no format change). cupy/nvcomp import inside functions so the
 module imports on CPU-only hosts. Output dtypes come from ``materialize.resolve_plan``
-(the same source of truth the CPU reader uses). See
-docs/superpowers/specs/2026-07-02-gpu-device-resident-decode-design.md.
+(the same source of truth the CPU reader uses).
 """
 
 from __future__ import annotations

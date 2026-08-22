@@ -18,7 +18,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12"]
+        # 3.13 joins the matrix with the #305 fix: `requires-python` now permits it, and
+        # tests/test_matrices.py's MatrixSpec.__eq__ regression is MEANINGLESS without it --
+        # the defect it guards is 3.13-only dataclass codegen, so that test passes with the
+        # fix deleted on 3.11/3.12. Matrix entries run in parallel, so this costs runner
+        # minutes, not wall clock; the 3.13 job additionally builds `bitshuffle` from its
+        # sdist (no cp313 wheel exists). NOTE it is a NEW status-check name -- branch
+        # protection lists required checks by name and will not include it until updated.
+        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,3 +55,27 @@ jobs:
         run: pytest tests/ -q --ignore=tests/benchmarks --ignore=tests/v2/test_rust_core.py
       - name: Lint
         run: ruff check src/ tests/
+      # The public-seed gate's OWN direction cases (#312). ~1 s, stdlib only, and run on every
+      # matrix entry WHERE PRESENT, on purpose: the scan walks the `ast`, so version-dependent
+      # parse behaviour is exactly what it catches. (In the public checkout it is present nowhere
+      # -- see the guard below.)
+      #
+      # THE GUARD IS LOAD-BEARING, not defensive noise. This file TRAVELS to the public repo while
+      # `scripts/` is on the seed's DROP list, so the public checkout has no
+      # `scripts/seed_public_repo.py` -- without the guard, public CI fails on every run, and it
+      # would have done so on the very next seed. (codex.)
+      #
+      # Deliberately NOT the gate run, which scans repo CONTENT: `unclassified` gates its exit
+      # code, so a newly added file in a path no KEEP/DROP rule covers -- `docs/tuning.md`,
+      # `CONTRIBUTING.md`, `.github/dependabot.yml` -- would turn an unrelated PR red until
+      # someone wrote a rule. That check belongs to whoever is seeding, which is when it matters.
+      #
+      # `--self-test` is NOT hermetic, and an earlier version of this comment wrongly said so
+      # (codex): besides the fixed-string direction cases it runs the live transforms, checks the
+      # REWRITE templates exist, and calls `git ls-files`. So it can fail on an ordinary change to
+      # a transform landmark or a template path -- which is the point, those are the seed's own
+      # invariants -- but not on merely adding a file. It needs the repo as its cwd, which is what
+      # Actions gives a `run:` step by default.
+      - name: Public-seed scanner self-test
+        if: hashFiles('scripts/seed_public_repo.py') != ''
+        run: python scripts/seed_public_repo.py --self-test

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from cellstream.errors import IncompatibleSchemaError, PackedArchiveError
@@ -84,10 +85,15 @@ def _index_shard_members(members: list[dict], manifest: dict) -> dict[str | None
 
 def _trailer_valid(path: Path) -> bool:
     try:
-        size = path.stat().st_size
-        if size < fmt.TRAILER_SIZE:
-            return False
+        # Sized through the fd this reads with, never `path.stat()` (#305): on an attribute-caching
+        # network filesystem a path stat can report a stale-SHORT st_size just after the archive was
+        # written, and this function would then parse the WRONG bytes as the trailer and report a
+        # perfectly good, freshly written archive as invalid. Opening first also refreshes the
+        # attribute, so there is nothing to retry.
         with path.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            if size < fmt.TRAILER_SIZE:
+                return False
             fh.seek(size - fmt.TRAILER_SIZE)
             t = fmt.parse_trailer(fh.read(fmt.TRAILER_SIZE))
             foff, flen = t["footer_offset"], t["footer_length"]
@@ -120,7 +126,6 @@ def _apply_recovery(path: Path) -> None:
     edit completed before its unlink (drop the stale backup); otherwise roll the
     tail back to the backed-up previous state. No-op when no .tailbak exists.
     """
-    import os
     import struct
 
     tailbak = path.with_suffix(path.suffix + ".tailbak")
@@ -138,7 +143,10 @@ def _apply_recovery(path: Path) -> None:
             f"Inspect/remove {tailbak} manually."
         )
     (sre,) = struct.unpack("<Q", raw[:8])
-    size = path.stat().st_size
+    # Through an fd, not path.stat() (#305): a stale-short size would put a VALID shard_region_end
+    # out of range and refuse a recovery that should have succeeded.
+    with path.open("rb") as sfh:
+        size = os.fstat(sfh.fileno()).st_size
     if not (fmt.HEAD_BLOCK_SIZE <= sre <= size) or sre % fmt.ALIGNMENT != 0:
         raise PackedArchiveError(
             f"{path}: .tailbak shard_region_end {sre} is out of range or misaligned; "

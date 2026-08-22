@@ -82,3 +82,56 @@ def test_decompose_rejects_sanitize_collision():
     a.layers["a_b"] = sp.csr_matrix(np.eye(2, dtype=np.uint16))
     with pytest.raises(ValueError, match="on-disk directory"):
         mx.decompose_anndata(a)
+
+
+def test_matrixspec_eq_returns_a_bool_with_array_valued_fields():
+    """CPython 3.13 generates a PAIRWISE dataclass ``__eq__`` instead of comparing the two field
+    tuples, which loses ``PyObject_RichCompareBool``'s identity shortcut and its bool coercion --
+    so with ``X`` holding a sparse matrix the generated ``__eq__`` returned the elementwise MATRIX
+    and any ``bool()`` of it raised "the truth value of an array ... is ambiguous".
+
+    Asserts ``is True`` / ``is False`` rather than truthiness on purpose: the wrong return is a
+    sparse matrix, which is neither truthy nor falsy but RAISES, so a plain ``assert a == b`` is
+    what let this reach a released version unnoticed on 3.13 while passing on 3.11 and 3.12.
+    """
+    m = sp.csr_matrix(np.ones((3, 3), dtype=np.uint16))
+    a = mx.MatrixSpec("k", "x", None, 3, m, None)
+    b = mx.MatrixSpec("k", "x", None, 3, m, None)
+    assert (a == b) is True
+    assert (a != b) is False
+    assert (a == mx.MatrixSpec("other", "x", None, 3, m, None)) is False
+    assert (a == 42) is False
+
+
+def test_matrixspec_eq_raises_on_distinct_but_equal_arrays():
+    """The deliberate limit of the fix, pinned so a future change to it is a decision, not a drift.
+
+    Two DIFFERENT arrays in the same field raise, because the field's own ``==`` returns an
+    elementwise result that has no truth value. That is what the pre-3.13 tuple comparison did too,
+    so this is not a regression and the fix restores it faithfully rather than papering over it --
+    only the SAME-object case, which used to short-circuit on identity, was broken on 3.13.
+
+    Gemini (PR #319) proposed making this raise-free by special-casing sparse matrices, arrays and
+    DataFrames. That is new semantics rather than a restoration, and it wants a shared helper across
+    four dataclasses, so it is tracked in #318 instead of decided here.
+    """
+    m1 = sp.csr_matrix(np.ones((3, 3), dtype=np.uint16))
+    m2 = sp.csr_matrix(np.ones((3, 3), dtype=np.uint16))
+    assert m1 is not m2
+    a = mx.MatrixSpec("k", "x", None, 3, m1, None)
+    b = mx.MatrixSpec("k", "x", None, 3, m2, None)
+    with pytest.raises(ValueError, match="truth value"):
+        a == b  # noqa: B015 -- the comparison itself is the thing under test
+
+
+def test_matrixspec_eq_with_a_dataframe_field():
+    """``var`` holds a DataFrame, whose ``==`` also returns a frame rather than a bool -- the same
+    trap on the other field, and the one a `decompose` result actually carries."""
+    var = pd.DataFrame(index=["g0", "g1"])
+    a = mx.MatrixSpec("x", "x", None, 2, None, var)
+    b = mx.MatrixSpec("x", "x", None, 2, None, var)
+    assert (a == b) is True
+    # Differing on an EARLIER field, so the tuple comparison short-circuits before `var`. Two
+    # genuinely different frames in the same field still raise, on every version -- that is
+    # pre-existing behaviour this fix deliberately does not change.
+    assert (a == mx.MatrixSpec("other", "x", None, 2, None, var)) is False

@@ -206,9 +206,16 @@ pub fn decode_blob_u32(
             unsafe { std::slice::from_raw_parts(blob.as_ptr() as *const u32, blob.len() / 4) };
         ffi_decode(words, out, expected)
     } else {
+        // `as_chunks::<4>()` rather than `chunks_exact(4)`: identical semantics (both yield
+        // blob.len()/4 groups and drop the same remainder) but it hands back `&[u8; 4]` directly,
+        // so the infallible-yet-panicking `try_into().unwrap()` goes away. Also what clippy 1.98's
+        // new `chunks_exact_to_as_chunks` lint demands -- CI's `stable` toolchain floats, so a new
+        // lint on untouched code turns every PR red; pinning it is #310.
         let words: Vec<u32> = blob
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
         ffi_decode(&words, out, expected)
     }
@@ -297,6 +304,47 @@ pub(crate) fn encode_frame<D: CountU32, I: IdxU32>(
 #[cfg(test)]
 mod bounds_tests {
     use super::*;
+
+    /// `decode_blob_u32` has two arms: a zero-copy reinterpret when the blob is 4-byte aligned, and
+    /// a byte-regrouping fallback when it is not. NOTHING in the Python suite reaches the fallback --
+    /// a numpy-backed payload is aligned -- so the two arms are proven equal here instead. Written
+    /// when the fallback was rewritten from `chunks_exact(4).map(try_into().unwrap())` to
+    /// `as_chunks::<4>()`; an untested rewrite in a decode hot path is how #269 and #273 happened.
+    #[test]
+    fn decode_blob_unaligned_fallback_matches_the_aligned_arm() {
+        let src: Vec<u32> = (0..300u32).map(|i| i * 7 + 1).collect();
+        let packed = ffi_encode(&src).unwrap_or_else(|_| panic!("encode failed"));
+        let aligned: Vec<u8> = packed.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let align = std::mem::align_of::<u32>();
+        assert!((aligned.as_ptr() as usize).is_multiple_of(align));
+
+        // A single leading pad byte is NOT enough: a Vec<u8> is only 1-byte aligned, so
+        // `&padded[1..]` lands on a 4-byte boundary whenever the allocation itself did -- the first
+        // draft of this test did exactly that, and its own guard assertion caught it. Instead
+        // over-allocate, read the real base address, and pick the offset that provably is NOT a
+        // multiple of 4.
+        let mut padded = vec![0u8; aligned.len() + align];
+        let base = padded.as_ptr() as usize;
+        let off = (align + 1 - (base % align)) % align;
+        padded[off..off + aligned.len()].copy_from_slice(&aligned);
+        let unaligned = &padded[off..off + aligned.len()];
+        assert!(
+            !(unaligned.as_ptr() as usize).is_multiple_of(align),
+            "the slice came out aligned; this test would prove nothing"
+        );
+
+        let mut from_aligned = Vec::new();
+        decode_blob_u32(&aligned, &mut from_aligned, src.len()).unwrap();
+        let mut from_unaligned = Vec::new();
+        decode_blob_u32(unaligned, &mut from_unaligned, src.len()).unwrap();
+
+        // `out` is deliberately left LONGER than `expected` (#269 defect A -- see
+        // decode_blob_allocates_beyond_expected), so compare the decoded prefix, then require the
+        // two arms to agree on the whole buffer including that slack.
+        assert_eq!(&from_aligned[..src.len()], &src[..]);
+        assert_eq!(&from_unaligned[..src.len()], &src[..]);
+        assert_eq!(from_unaligned, from_aligned);
+    }
 
     #[test]
     fn pfor_encode_capacity_is_generous_and_saturating() {

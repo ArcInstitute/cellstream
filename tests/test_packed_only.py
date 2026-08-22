@@ -7,8 +7,54 @@ import scipy.sparse as sp
 
 import cellstream
 from cellstream import ShardedArchive, read_h5ad, read_obs, read_var, write_sharded
-from cellstream.errors import PackedOnlyError
+from cellstream.errors import LEGACY_V1_REMEDY, PACKED_ONLY_MIGRATION, PackedOnlyError
 from tests._archive_helpers import write_directory
+
+# errors.LEGACY_V1_REMEDY, verbatim and as a LITERAL. Error text is API here, so the expected
+# value has to live in the test: `LEGACY_V1_REMEDY in message` alone only proves the sites carry
+# whatever the constant currently says, so keeping the anchor and swapping the advice for
+# `uv add`/`conda install` left every assertion green (codex). #311 also replaced an older anchor
+# ("shardad.git@v0.4.0"); leaving THAT one in place would have made the negative arm vacuous,
+# since it asserts absence and so passes for free once the string exists nowhere.
+_EXPECTED_REMEDY = (
+    "no installable release can read a legacy v1/directory archive -- the last one that could, "
+    "v0.4.0, predates this project's rename and was never published to PyPI. Re-encode from the "
+    "original source data with the current writer instead."
+)
+
+# errors.PACKED_ONLY_MIGRATION, verbatim: the remedy with the packed-container sentence in front.
+_EXPECTED_MIGRATION = (
+    " Since v0.5 only the single-file packed container is supported (SHPK head magic, "
+    "conventionally .shad); " + _EXPECTED_REMEDY
+)
+
+# Substrings no legacy-archive message may contain, in any case. #311's URL was lowercase, but
+# GitHub hosts and paths are case-insensitive, so a `"github.com" not in message` check would let
+# `GitHub.com/...` straight through -- and so would the seed gate's arm if IT were case-sensitive
+# (it is not; see `_NonPublicArcRepo` there). `githubusercontent.com` is the raw-content host, a
+# second spelling of the same leak. (codex.)
+_FORBIDDEN_IN_MESSAGE = ("github.com", "githubusercontent.com", "pip install", "git+")
+
+
+def test_the_shared_remedy_text_is_unchanged():
+    """The one assertion that pins the CONTENT rather than the plumbing (#311).
+
+    Separate from the message arms on purpose: they prove each site carries the remedy, this
+    proves the remedy still says what it is supposed to say. Change the wording and this is the
+    test that fails, which is the signal you are editing user-facing API text.
+    """
+    assert LEGACY_V1_REMEDY == _EXPECTED_REMEDY
+    assert PACKED_ONLY_MIGRATION == _EXPECTED_MIGRATION
+
+
+def _assert_names_no_install(message: str) -> None:
+    """The remedy must END the message, in full, with no reachable-looking install anywhere."""
+    assert message.endswith(_EXPECTED_REMEDY), (
+        "the message must carry the whole remedy verbatim, as its last words"
+    )
+    lowered = message.lower()
+    for forbidden in _FORBIDDEN_IN_MESSAGE:
+        assert forbidden not in lowered, f"{forbidden!r} is back in a legacy-archive message"
 
 
 def _tiny():
@@ -109,9 +155,12 @@ def test_a_missing_path_raises_FileNotFoundError_not_the_migration_note(tmp_path
         calls[entry]()
     # The distinguishing assertion: FileNotFoundError is not a CellstreamError, so a leftover
     # PackedOnlyError could not satisfy pytest.raises above -- but a future change could make
-    # a subclass do both, and the point is that the caller is NOT sent to the legacy
-    # migration install (which names the pre-rename project on purpose).
-    assert "shardad.git@v0.4.0" not in str(exc_info.value)
+    # a subclass do both, and the point is that the caller is NOT handed the legacy-archive
+    # migration guidance. Asserted as the WHOLE message rather than the absence of a fragment,
+    # because absence-only passes for any guidance that happens to be worded differently: the
+    # message must say where the file is and nothing else. (codex.)
+    expected = str(missing) if entry == "read_h5ad" else f"no such archive: {missing}"
+    assert str(exc_info.value) == expected
 
 
 @pytest.mark.parametrize(
@@ -144,7 +193,41 @@ def test_public_read_entry_points_reject_a_directory(tmp_path, entry):
     with pytest.raises(PackedOnlyError) as exc_info:
         calls[entry]()
     message = str(exc_info.value)
-    assert "shardad.git@v0.4.0" in message
+    _assert_names_no_install(message)
     fragment = fragments.get(entry)
     if fragment is not None:
         assert fragment in message
+
+
+def test_no_legacy_archive_message_names_an_inaccessible_install(tmp_path):
+    """#311: neither legacy-archive message may send a reader to a URL that 404s for them.
+
+    Both SHIPPED sites are exercised rather than the constants they share: the
+    ``PackedOnlyError`` from the packed-only reject path, and the ``ValueError`` from
+    ``write_sharded``'s ``format`` guard. The remedy's own wording is pinned separately, by
+    ``test_the_shared_remedy_text_is_unchanged`` -- asserting ``LEGACY_V1_REMEDY in message``
+    here would only prove the site carries whatever that constant currently says.
+
+    The seed gate's ``non-public ArcInstitute repo url`` SANITIZE arm (#312) covers the same text,
+    but only when someone seeds the public repo, whereas this runs on every push. The
+    ``endswith(_EXPECTED_REMEDY)`` assertion is what stops the absence checks going vacuous:
+    without it they would all pass on a message that had lost the guidance entirely.
+    """
+    with pytest.raises(PackedOnlyError) as packed:
+        ShardedArchive(_directory(tmp_path))
+    with pytest.raises(ValueError) as bad_format:
+        write_sharded(_tiny(), tmp_path / "v1.shad", format="v1")
+
+    # EXACT, not `endswith`. A suffix pin stays green for `"Run uv add shardad==0.4.0. " +
+    # LEGACY_V1_REMEDY`: the message still ends with the remedy and still contains none of the
+    # forbidden substrings, so an unreachable instruction can be smuggled in FRONT of it. Error
+    # text is API here, so the whole of both shipped messages is pinned. (codex.)
+    assert str(packed.value) == (
+        "ShardedArchive requires a single-file packed archive." + _EXPECTED_MIGRATION
+    )
+    assert str(bad_format.value) == (
+        "format must be 'v2', got 'v1'. The legacy v1 (h5ad-shard) format was removed in #154 "
+        "and has been unsupported since v0.5; " + _EXPECTED_REMEDY
+    )
+    for message in (str(packed.value), str(bad_format.value)):
+        _assert_names_no_install(message)

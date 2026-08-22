@@ -1380,7 +1380,35 @@ pub fn reorder_frames(
     }
     let n_src = in_offsets.len() - 1;
 
-    let staged_len = std::fs::metadata(&staging_path)?.len();
+    // Open the staging file ONCE, here, and size it from THAT HANDLE (#305). Never
+    // `std::fs::metadata(path)`: on an attribute-caching network filesystem -- WekaFS, which backs
+    // every Arc store, and NFS -- a path stat can report a stale-SHORT st_size immediately after an
+    // append through a different fd, while fstat on an open fd, lseek(SEEK_END) and the bytes
+    // themselves are all already correct. No bytes are lost; only the cached attribute lags. Sizing
+    // the staging file with a path stat therefore REJECTED perfectly good writes (measured: 20 of
+    // 1500 cell writes on Python 3.11 + wekafs, 0 of 1500 on local ext4 -- which is why those
+    // failures were misread as a CPython 3.13 defect).
+    //
+    // The handle is then USED BY the copy loop below, so the file read is the file measured: the
+    // path cannot be replaced between the size check and the read. That is the whole guarantee -- a
+    // concurrent writer on the same inode could still change the bytes after `metadata()`, and
+    // nothing here claims otherwise. (codex, checkpoint 2 round 3.)
+    // `File::metadata` is fstat(2), so this is open+fstat where it used to be stat+open -- the same
+    // two syscalls, just in the order that makes the answer trustworthy.
+    //
+    // The open happens INSIDE allow_threads: on exactly the network filesystems that motivate this
+    // change, open() can block for a while, and it used to be off the GIL because it lived in the
+    // copy closure. Keeping it there costs nothing and keeps other Python threads running.
+    // (codex, checkpoint 2 finding 2.)
+    //
+    // No Python-level test can inject this (the stale stat lives below the FFI boundary); the
+    // guard's own behaviour on a genuinely wrong in_offsets is covered by tests/cell/
+    // test_reorder_frames.py, and the Python twin's fix by test_stale_stat_size.py.
+    let (mut sf, staged_len) = py.allow_threads(|| -> std::io::Result<(File, u64)> {
+        let f = File::open(&staging_path)?;
+        let len = f.metadata()?.len();
+        Ok((f, len))
+    })?;
     let last = in_offsets[n_src];
     // last >= 0 is already guaranteed (in_offsets[0] == 0 and non-decreasing), so `as u64` exact.
     if last as u64 != staged_len {
@@ -1428,7 +1456,6 @@ pub fn reorder_frames(
     // any order); sequential writes of the output. `out_offsets` was fully computed above from
     // the VALIDATED in_offsets/perm, so the lengths used here need no further checking.
     py.allow_threads(|| -> std::io::Result<()> {
-        let mut sf = File::open(&staging_path)?;
         let mut of = BufWriter::new(File::create(&out_path)?);
         let mut buf: Vec<u8> = Vec::new();
         for (r, &p) in perm.iter().enumerate() {

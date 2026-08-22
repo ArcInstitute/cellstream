@@ -37,7 +37,7 @@ _PRESETS: dict[str, dict[str, Any]] = {
     },
     # Opt-in: Blosc2-SHUFFLE on the CSR `data` array only (+18% on real
     # counts; decode faster). indices/indptr keep Blosc1-bitshuffle (SHUFFLE
-    # regresses indices). See docs/superpowers/specs/2026-06-01-v1-data-shuffle-codec-design.md
+    # regresses indices).
     "blosc-zstd-1-u16u16-datashuf": {
         "filter_kwargs": hdf5plugin.Blosc(cname="zstd", clevel=1, shuffle=_BITSHUFFLE),
         "data_filter_kwargs": hdf5plugin.Blosc2(

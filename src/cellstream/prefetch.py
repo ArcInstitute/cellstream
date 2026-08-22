@@ -1,5 +1,4 @@
-"""Decode-ahead (prefetch) streaming over group shards. See
-docs/superpowers/specs/2026-06-28-prefetch-streaming-reader-design.md (#159).
+"""Decode-ahead (prefetch) streaming over group shards (#159).
 
 A single background producer thread decodes batches of consecutive non-reference
 shards via the existing parallel reader and hands per-shard AnnData views to the

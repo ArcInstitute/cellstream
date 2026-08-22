@@ -8,7 +8,13 @@ build-backend = "setuptools.build_meta"
 name = "cellstream"
 description = "Compressed per-cell storage for large single-cell AnnData, built for scattered random access"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+# The `<3.13` cap 0.9.1 shipped is LIFTED: it rested on intermittent per-cell write failures read
+# as a CPython 3.13 defect, and they were not one -- a path stat() on WekaFS can report a
+# stale-SHORT st_size, which hit Python 3.11 HARDER than 3.13 and never hit local ext4 at all
+# (#305). 3.13 has no `bitshuffle` wheel, so an install there builds that sdist; that is a build
+# cost, not a failure. CI runs 3.11, 3.12 and 3.13; the WHEELS are cp311/cp312 only (see
+# release.yml), which is a distribution fact rather than a language-support one.
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Alex Dobin" }, { name = "Arc Institute" }]
@@ -20,6 +26,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     # Wheels are Linux x86_64 only; other platforms build from the sdist. See release.yml.

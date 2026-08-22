@@ -100,9 +100,18 @@ def _write_member(out, src_path: Path, *, delete_after: bool) -> tuple[int, int]
     if pad:
         out.write(b"\x00" * pad)
     offset = out.tell()
-    length = src_path.stat().st_size
     with src_path.open("rb") as fh:
         shutil.copyfileobj(fh, out, length=1 << 20)
+    # The bytes ACTUALLY copied, never src_path.stat().st_size (#305). copyfileobj's `length` is a
+    # buffer size, not a byte limit, so it always copies the whole file -- while a path stat on an
+    # attribute-caching network filesystem (WekaFS on every Arc store, and NFS) can read a
+    # stale-SHORT st_size right after the member was written. Recording that value writes a footer
+    # entry SHORTER than the member really is: a packed archive that reports a successful write and
+    # is wrong on disk. Deriving it from the stream cannot disagree with what was written.
+    #
+    # No syscall claim: `BufferedWriter.tell()` asks the raw stream for its position, so this trades
+    # a stat() for an lseek() rather than saving one. (Copilot.)
+    length = out.tell() - offset
     if delete_after:
         src_path.unlink()
     return offset, length
@@ -377,9 +386,16 @@ def _update_metadata_packed(file, *, new_obs=None, new_var=None, unsafe_no_lock=
         if pa.has_member("groups.json"):
             metadata_blobs.append(("groups.json", "groups", pa.member_bytes("groups.json")))
 
-        # Back up the old tail (prefixed with its shard_region_end u64) for rollback.
-        size = file.stat().st_size
+        # Back up the old tail (prefixed with its shard_region_end u64) for rollback. Sized through
+        # the fd that reads it, never `file.stat()`: a stale-short size on a network filesystem
+        # would back up a TRUNCATED tail, so a crash between here and the rewrite below would
+        # recover the archive to a short one (#305). `seek(END)` returns the same number fstat
+        # would, on the handle that is being opened anyway -- and unlike `_file_size` elsewhere,
+        # this one IS the handle the read uses, so the path cannot be swapped between sizing it and
+        # reading it. (Not a guarantee against a concurrent writer on the same inode; nothing here
+        # claims one.)
         with file.open("rb") as rfh:
+            size = rfh.seek(0, os.SEEK_END)
             rfh.seek(sre)
             old_tail = rfh.read(size - sre)
         tailbak = file.with_suffix(file.suffix + ".tailbak")

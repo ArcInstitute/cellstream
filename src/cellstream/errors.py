@@ -11,20 +11,28 @@ from __future__ import annotations
 
 from typing import NoReturn
 
-#: Appended to every PackedOnlyError message by :func:`reject_non_packed`. Keeps the
-#: install command the pre-B3b note carried: R1 ("recognize and reject" rather than
-#: degrade to FileNotFoundError) was chosen so a caller holding a legacy archive gets
-#: something ACTIONABLE, and this is the actionable part.
-# NOTE the old project name is DELIBERATE and must not be "fixed" to cellstream: every
-# pre-v0.5 release exists only as shardad, and only in the git repo -- it was never on PyPI.
-# `pip install 'cellstream<0.5'` would be impossible advice, which defeats the point of
-# carrying a migration note at all.
+#: The one true statement about a legacy v1/directory archive, shared by every message that has
+#: to make it -- :data:`PACKED_ONLY_MIGRATION` here and ``write.py``'s ``format`` guard.
+# NOTE it names NO install command, deliberately (#311). The pre-#311 text told the reader to
+# pip-install a git URL for the pre-rename repository at tag v0.4.0 -- an instruction that cannot
+# work for the audience reading it, because that repository is not public and v0.4.0 was never
+# uploaded to PyPI either. `pip install 'cellstream<0.5'` is equally impossible: nothing was ever
+# published under this name that early. R1 ("recognize and reject" rather than degrade to
+# FileNotFoundError) was chosen so a caller holding a legacy archive gets something ACTIONABLE --
+# so name the remedy that exists, re-encoding from the source, rather than a URL that 404s. The
+# seed gate's `non-public ArcInstitute repo url` SANITIZE arm (#312) refuses to seed the public
+# repo if one comes back -- and `tests/test_packed_only.py` fails on every push, which is the arm
+# that runs without anyone remembering to: CI does not invoke the seed gate.
+LEGACY_V1_REMEDY = (
+    "no installable release can read a legacy v1/directory archive -- the last one that could, "
+    "v0.4.0, predates this project's rename and was never published to PyPI. Re-encode from the "
+    "original source data with the current writer instead."
+)
+
+#: Appended to every PackedOnlyError message by :func:`reject_non_packed`.
 PACKED_ONLY_MIGRATION = (
-    " Since v0.5 -- a release made before the project was renamed -- only the single-file "
-    "packed container is supported (SHPK head magic, "
-    "conventionally .shad); to read or migrate a legacy v1/directory archive, install the last "
-    "release that still holds it -- published before the rename, under the former project name: "
-    'pip install "git+https://github.com/ArcInstitute/shardad.git@v0.4.0".'
+    " Since v0.5 only the single-file packed container is supported (SHPK head magic, "
+    "conventionally .shad); " + LEGACY_V1_REMEDY
 )
 
 
@@ -88,9 +96,10 @@ class PackedOnlyError(CellstreamError):
     """A non-packed archive (v1 h5ad-shard or v2 directory) was passed to a reader.
 
     Since v0.5 -- a release made under the project's former name -- only the
-    single-file packed (SHPK / .shad) container is supported. The install command
-    for reading or migrating a legacy archive is in :data:`PACKED_ONLY_MIGRATION`,
-    which is the single place it is spelled out.
+    single-file packed (SHPK / .shad) container is supported. What to do with a
+    legacy archive instead is in :data:`PACKED_ONLY_MIGRATION`, which is the single
+    place it is spelled out. There is deliberately no install command to offer: see
+    :data:`LEGACY_V1_REMEDY` (#311).
 
     Read-side only since #154 part B3b: the write side no longer has a container
     to reject, so ``write_sharded(container=...)`` is an ordinary ``TypeError``.

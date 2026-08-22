@@ -14,6 +14,7 @@ from pathlib import Path
 import anndata as ad
 
 from cellstream import grouping, shard_io
+from cellstream.errors import LEGACY_V1_REMEDY
 from cellstream.matrices import real_layer_names
 
 ADataOrPath = ad.AnnData | str | Path
@@ -294,10 +295,7 @@ def write_sharded(
     if format != "v2":
         raise ValueError(
             f"format must be 'v2', got {format!r}. The legacy v1 (h5ad-shard) format was "
-            "removed in #154 and has been unsupported since v0.5; to read or migrate a v1 "
-            "archive, install the last release that still holds it -- published before the "
-            "rename, under the former project name: pip install "
-            "'git+https://github.com/ArcInstitute/shardad.git@v0.4.0'."
+            f"removed in #154 and has been unsupported since v0.5; {LEGACY_V1_REMEDY}"
         )
 
     if codec is None:
