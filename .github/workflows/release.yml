@@ -424,6 +424,100 @@ jobs:
               *) echo "ok   $(basename "$f")" ;;
             esac
           done
+      # The `validate` job below is push-only by design, so a DISPATCH skips it -- and the
+      # documented rehearsal is a dispatch on a tag ref. Without this, rehearsing an accidentally
+      # tagged commit uploads a release to TestPyPI whose changelog describes a different one, and
+      # TestPyPI will not accept that version again either. So the changelog check is repeated
+      # here. The version comes from the SDIST FILENAME rather than the tag, which makes the step
+      # work for every dispatch; the step above has already refused a `+local` version, so what
+      # reaches here is a real release version. (codex, checkpoint 2.)
+      - name: The shipped CHANGELOG must name the version being uploaded
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sdists=(dist/cellstream-*.tar.gz)
+          [ "${#sdists[@]}" -eq 1 ] || {
+            echo "FATAL: expected exactly 1 sdist, got ${#sdists[@]}"; exit 1; }
+          base="$(basename "${sdists[0]}")"
+          expected="${base#cellstream-}"; expected="${expected%.tar.gz}"
+          # Canonical X.Y.Z, leading zeroes rejected -- the same shape `validate` requires and the
+          # same one the seed gate requires of the changelog heading, so all three agree on what a
+          # release version IS.
+          [[ "$expected" =~ ^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}$ ]] \
+            || { echo "FATAL: '$expected' is not a canonical X.Y.Z version"; exit 1; }
+          # On a TAG ref -- the documented rehearsal -- the tag and the artifacts must name the
+          # same release. On any other ref the step above has already refused the `+local` version
+          # this would otherwise carry, so there is nothing to compare against.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME:-}" != "v$expected" ]; then
+            echo "FATAL: dispatched on tag ${GITHUB_REF_NAME} but the sdist is $expected"; exit 1
+          fi
+          # Every artifact must carry THIS version. Without it a stray `cellstream-0.9.3-*.whl`
+          # with no `+` passes every other check here and gets uploaded alongside the 0.9.2 sdist.
+          # This is a version-agreement check only -- it deliberately does NOT re-check the exact
+          # cp311/cp312 ABI set or the cardinality. `validate` owns that policy for the path that
+          # reaches PyPI, and a third copy of that loop would trade a rehearsal-index check for
+          # exactly the divergence risk this file already guards against. (codex round 4.)
+          # `files` is re-collected HERE: every `run:` block is its own shell, so the array the
+          # step above built is gone. Populating it there and looping here silently iterated
+          # nothing -- caught by running this step against a fixture directory. (codex round 4.)
+          all=(dist/*)
+          [ "${#all[@]}" -gt 0 ] || { echo "FATAL: no artifacts to publish"; exit 1; }
+          for f in "${all[@]}"; do
+            b="$(basename "$f")"
+            case "$b" in
+              cellstream-"$expected".tar.gz|cellstream-"$expected"-*.whl) ;;
+              *) echo "FATAL: $b does not carry version $expected"; exit 1 ;;
+            esac
+          done
+          if ! changelog="$(tar -xzOf "${sdists[0]}" "cellstream-$expected/CHANGELOG.md" \
+                              2>/dev/null)"; then
+            echo "FATAL: the sdist carries no CHANGELOG.md"; exit 1
+          fi
+          # Newest `## [...]` heading. 0-3 spaces of indent is a heading and 4+ is an indented
+          # code block; a fence is closed only by the same character, at least as many of them,
+          # and nothing else on the line -- SPACES AND TABS only, because `[[:space:]]` also
+          # matches Unicode spaces in a UTF-8 locale and the pre-publication reader does not.
+          # Records are split on CR too: awk breaks records on LF alone, so a bare CR would keep
+          # a heading joined to the previous line here while the other reader saw two lines.
+          # A heading must also CLOSE its bracket: matching `^## \[` alone marked a malformed
+          # `## [no-close` line as found and suppressed the real heading below it, so a changelog
+          # the pre-publication check approved failed here instead. All three divergences were
+          # found by differential probing. It does NOT
+          # `exit` after the first match -- awk exiting early leaves the upstream `printf` writing
+          # into a closed pipe, and under `set -o pipefail` that intermittently kills the job with
+          # 141 on a changelog larger than the pipe buffer. Reproduced; the fix is to consume all
+          # input. (codex, checkpoint 2.)
+          top="$(printf '%s\n' "$changelog" | awk '
+            function scan(s,   c, k, info, ind) {
+              ind = 0
+              while (ind < 4 && substr(s, ind + 1, 1) == " ") ind++
+              if (ind >= 4) return
+              s = substr(s, ind + 1)
+              c = substr(s, 1, 1)
+              if (c == "`" || c == "~") {
+                k = 0
+                while (substr(s, k + 1, 1) == c) k++
+                if (k >= 3) {
+                  info = substr(s, k + 1)
+                  if (fence == "") {
+                    if (!(c == "`" && index(info, "`") > 0)) { fence = c; flen = k }
+                  } else if (c == fence && k >= flen && info ~ /^[ \t]*$/) {
+                    fence = ""; flen = 0
+                  }
+                  return
+                }
+              }
+              if (fence != "") return
+              if (!got && s ~ /^## \[[^]]*\]/) { print s; got = 1 }
+            }
+            { np = split($0, parts, /\r/); for (ip = 1; ip <= np; ip++) scan(parts[ip]) }
+            ' | sed -n 's/^## \[\([^]]*\)\].*/\1/p')"
+          [ -n "$top" ] || { echo "FATAL: the shipped CHANGELOG.md has no '## [...]' heading"; exit 1; }
+          [ "$top" = "$expected" ] || {
+            echo "FATAL: uploading $expected but the shipped CHANGELOG's newest entry is [$top]"
+            exit 1
+          }
+          echo "ok   the shipped CHANGELOG's newest entry is [$top]"
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
@@ -473,8 +567,11 @@ jobs:
           echo "tag=$TAG  expected version=$expected"
           # A release tag must name a release: X.Y.Z, no .devN, no pre/post segment, no local
           # `+` part. Anything else is an accident that should not reach PyPI.
-          [[ "$expected" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-            || { echo "FATAL: '$TAG' is not a vX.Y.Z release tag"; exit 1; }
+          # Canonical: leading zeroes rejected, because packaging normalises `01.02.003` to
+          # `1.2.3` and the tag would then not name the version that ships. The same shape the
+          # TestPyPI step and the pre-publication changelog check require. (codex round 4.)
+          [[ "$expected" =~ ^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){2}$ ]] \
+            || { echo "FATAL: '$TAG' is not a canonical vX.Y.Z release tag"; exit 1; }
           shopt -s nullglob
           files=(dist/*)
           [ "${#files[@]}" -gt 0 ] || { echo "FATAL: no artifacts to publish"; exit 1; }
@@ -501,7 +598,63 @@ jobs:
           [ "$cp311" -eq 1 ] || { echo "FATAL: expected exactly 1 cp311 wheel, got $cp311"; exit 1; }
           [ "$cp312" -eq 1 ] || { echo "FATAL: expected exactly 1 cp312 wheel, got $cp312"; exit 1; }
           [ "$sdists" -eq 1 ] || { echo "FATAL: expected exactly 1 sdist, got $sdists"; exit 1; }
-          echo "validated: cp311 + cp312 wheels + 1 sdist, all at $expected"
+          # Everything above ties the tag to the BYTES. Nothing tied it to what those bytes SAY:
+          # setuptools_scm derives the version from the tag, so a mistyped `v0.9.3` builds, passes
+          # every check above and publishes 0.9.3 carrying a CHANGELOG whose newest entry is
+          # 0.9.2 -- a release that describes a different release. Read the changelog OUT OF THE
+          # SDIST rather than out of a checkout: the artifact is what ships, and this job does not
+          # check out the repository at all.
+          if ! changelog="$(tar -xzOf "dist/cellstream-$expected.tar.gz" \
+                              "cellstream-$expected/CHANGELOG.md" 2>/dev/null)"; then
+            echo "FATAL: the sdist carries no CHANGELOG.md"; exit 1
+          fi
+          # Newest `## [...]` heading. 0-3 spaces of indent is a heading and 4+ is an indented
+          # code block; a fence is closed only by the same character, at least as many of them,
+          # and nothing else on the line -- SPACES AND TABS only, because `[[:space:]]` also
+          # matches Unicode spaces in a UTF-8 locale and the pre-publication reader does not.
+          # Records are split on CR too: awk breaks records on LF alone, so a bare CR would keep
+          # a heading joined to the previous line here while the other reader saw two lines.
+          # A heading must also CLOSE its bracket: matching `^## \[` alone marked a malformed
+          # `## [no-close` line as found and suppressed the real heading below it, so a changelog
+          # the pre-publication check approved failed here instead. All three divergences were
+          # found by differential probing. It does NOT
+          # `exit` after the first match -- awk exiting early leaves the upstream `printf` writing
+          # into a closed pipe, and under `set -o pipefail` that intermittently kills the job with
+          # 141 on a changelog larger than the pipe buffer. Reproduced; the fix is to consume all
+          # input. (codex, checkpoint 2.)
+          top="$(printf '%s\n' "$changelog" | awk '
+            function scan(s,   c, k, info, ind) {
+              ind = 0
+              while (ind < 4 && substr(s, ind + 1, 1) == " ") ind++
+              if (ind >= 4) return
+              s = substr(s, ind + 1)
+              c = substr(s, 1, 1)
+              if (c == "`" || c == "~") {
+                k = 0
+                while (substr(s, k + 1, 1) == c) k++
+                if (k >= 3) {
+                  info = substr(s, k + 1)
+                  if (fence == "") {
+                    if (!(c == "`" && index(info, "`") > 0)) { fence = c; flen = k }
+                  } else if (c == fence && k >= flen && info ~ /^[ \t]*$/) {
+                    fence = ""; flen = 0
+                  }
+                  return
+                }
+              }
+              if (fence != "") return
+              if (!got && s ~ /^## \[[^]]*\]/) { print s; got = 1 }
+            }
+            { np = split($0, parts, /\r/); for (ip = 1; ip <= np; ip++) scan(parts[ip]) }
+            ' | sed -n 's/^## \[\([^]]*\)\].*/\1/p')"
+          [ -n "$top" ] || { echo "FATAL: the shipped CHANGELOG.md has no '## [...]' heading"; exit 1; }
+          [ "$top" = "$expected" ] || {
+            echo "FATAL: the tag says $expected but the shipped CHANGELOG's newest entry is [$top]"
+            echo "       (an [Unreleased] heading here means this commit was never cut as a release)"
+            exit 1
+          }
+          echo "ok   the shipped CHANGELOG's newest entry is [$top]"
+          echo "validated: cp311 + cp312 wheels + 1 sdist + CHANGELOG, all at $expected"
 
   publish-pypi:
     name: publish to PyPI

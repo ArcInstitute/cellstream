@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from cellstream._dataclass_eq import field_tuple_eq
 from cellstream.errors import InsufficientShmError
 
 SHM_DIR = "/dev/shm"
@@ -158,6 +159,11 @@ class DenseShmBundle:
         _release_segment(self.array)
 
 
+# `data`/`indices`/`indptr` are np.memmap, i.e. ndarray subclasses that do not override
+# __eq__ -- see `cellstream._dataclass_eq` (#318). `dir` sorts first and the allocator gives
+# every bundle a unique one, so independently allocated bundles short-circuit before the
+# arrays; two bundles sharing a dir (a `dataclasses.replace`, say) do not, and raised on 3.13.
+@field_tuple_eq
 @dataclass
 class MmapBundle:
     """File-mmap backing (sibling of ShmBundle) for out-of-shm reads.

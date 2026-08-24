@@ -63,13 +63,13 @@ uv pip install cellstream        # or, inside a uv project: uv add cellstream
 
 **Wheels cover Linux x86_64 with SSE4.1 and glibc ≥ 2.28, on CPython 3.11 and 3.12** (they are
 tagged `manylinux_2_28`). They carry the prebuilt Rust extension, so nothing compiles at install
-time and every dependency resolves to a wheel. This is the supported path, and the only
-configuration this release claims — see
+time and every dependency resolves to a wheel. This is the supported path and the one that needs
+no toolchain; 3.13 is supported too, from the sdist — see
 [Platform support](#platform-support-and-building-from-source). Check which one you are on:
 
 ```bash
 cellstream runtime
-# cellstream 0.9.1 | rust=yes | extension present and enabled
+# cellstream <version> | rust=yes | extension present and enabled
 ```
 
 **conda / mamba** — create the environment with conda/mamba, then install cellstream with pip; all
@@ -101,10 +101,9 @@ reason. `pre-commit` is not an extra at all: `pip install pre-commit` separately
 ### Platform support, and building from source
 
 **Supported: Linux x86_64 with SSE4.1, glibc ≥ 2.28, on CPython 3.11, 3.12 or 3.13.** The
-**wheels** cover 3.11 and 3.12. 3.13 is supported and tested on `main`, and will install from the
-sdist **from the next release onward** — the released 0.9.1 carries a `<3.13` cap and cannot be
-installed there at all, sdist or otherwise. See **CPython 3.13** below. Other platforms build from
-source and are not claimed.
+**wheels** cover 3.11 and 3.12; on 3.13 `pip` falls back to the sdist and builds from source,
+which needs a Rust toolchain and a C++11 compiler. See **CPython 3.13** below. Other platforms
+build from source and are not claimed.
 
 The SSE4.1 requirement is real but **not expressed by the wheel tag** — `manylinux_2_28_x86_64` is
 a glibc statement. The vendored FastPFor is compiled with `-msse4.1` and the shim asks for
@@ -122,26 +121,26 @@ sysctl machdep.cpu.features 2>/dev/null | grep -qi 'sse4\.1' && echo "SSE4.1: ye
 
 Where no wheel is published for your platform, `pip install cellstream` falls back to the sdist and
 builds from source — provided the release supports your interpreter at all. A `requires-python` cap
-is refused before any sdist is considered, which is exactly what 0.9.1 does on 3.13.
+is refused before any sdist is considered, which is why `cellstream==0.9.1` cannot be installed on
+3.13 whatever build tooling is present.
 
-**CPython 3.13.** 0.9.1 excluded it, on the strength of intermittent per-cell write failures that
-were read as a 3.13 defect. They were not one — a path `stat()` on a distributed filesystem can
-report a stale-short size, which hit **3.11 harder than 3.13** and never hit a local disk at all;
-see the CHANGELOG. The exclusion is lifted for the next release, which also fixes the underlying
-bug. Two things to know in the meantime:
+**CPython 3.13.** 0.9.1 excluded it (`requires-python = ">=3.11,<3.13"`), on the strength of
+intermittent per-cell write failures that were read as a 3.13 defect. They were not one — a path
+`stat()` on a distributed filesystem can report a stale-short size, which hit **3.11 harder than
+3.13** and never hit a local disk at all; see the CHANGELOG. **0.9.2 lifts the exclusion and fixes
+the underlying bug.** Two things to know:
 
-- **Until that release, `pip install cellstream` on 3.13 still fails**, because 0.9.1 is what the
-  index serves and it carries the cap. 0.9.0 and the 0.0.1 name placeholder stay yanked — 0.9.0
-  because every *functional* release before the fix carries that bug on a distributed filesystem
-  whatever the Python version, 0.0.1 because it is a name placeholder with no working code. A yank is a soft signal, so an *exact* pin such as `pip install cellstream==0.9.0`
-  still installs; that is unsupported.
-- Once that release lands, a 3.13 install will build **two** sdists, not one: 3.13 has no
-  `bitshuffle` wheel either. Until then an *unpinned* `pip install cellstream` builds nothing there
-  — the cap is refused before any sdist is fetched. What *does* resolve there is not equivalent: an
-  exact pin to any **yanked** release (`==0.9.0`, or the `==0.0.1` placeholder) predates the cap but
-  also predates the fix, and is **unsupported**; a VCS install from this repository's default branch
-  **carries the fix** and is simply not a release yet. CI already runs 3.11, 3.12 and 3.13, and the
+- **A 3.13 install builds two sdists, not one.** Neither this package nor `bitshuffle` publishes a
+  cp313 wheel, so `pip install cellstream` on 3.13 compiles both, which needs a Rust toolchain and
+  a C++11 compiler. That is a build cost, not a failure: CI runs 3.11, 3.12 and 3.13, and the
   classifiers claim all three.
+- **No earlier release is a supported option there.** 0.9.1 remains uninstallable on 3.13: it
+  carries the cap, which is refused before any sdist is considered. 0.9.0 and the 0.0.1 name
+  placeholder remain yanked — 0.9.0 because every *functional* release before the fix carries that
+  bug on a distributed filesystem whatever the Python version, 0.0.1 because it is a name
+  placeholder with no working code. A yank is a soft signal rather than a deletion, so an *exact*
+  pin such as `pip install cellstream==0.9.0` does still install; it predates the fix and is
+  unsupported.
 
 Note what a source build does **not** buy you: a wheel tag cannot express an ISA
 requirement, so on an x86_64 machine without SSE4.1 pip takes the *wheel* and the fault above still

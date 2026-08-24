@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from cellstream._dataclass_eq import field_tuple_eq
+
 
 def validate_sort_params(*, group_by, sort_within_group, sort_order):
     """Validate the grouped-write sort knobs (``sort_within_group``, ``sort_order``).
@@ -202,6 +204,7 @@ def validate_group_label_collision(values, *, where: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@field_tuple_eq
 @dataclass(frozen=True)
 class ShardPlan:
     """Output of the group-shard planner.

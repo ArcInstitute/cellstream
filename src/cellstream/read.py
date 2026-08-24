@@ -23,6 +23,7 @@ import scipy.sparse as sp
 
 from cellstream import h5ad_io
 from cellstream import shm as _shm
+from cellstream._dataclass_eq import field_tuple_eq
 from cellstream.errors import reject_non_packed
 from cellstream.manifest import validate_group_records
 from cellstream.v2 import reader_cpu
@@ -38,6 +39,7 @@ def _materialization_kwargs_set(container, data_dtype, index_dtype):
     return container != "csr" or data_dtype is not None or index_dtype is not None
 
 
+@field_tuple_eq
 @dataclass(frozen=True)
 class ShardCSRDLPack:
     """A streamed shard's CSR arrays for a GPU consumer (#160).

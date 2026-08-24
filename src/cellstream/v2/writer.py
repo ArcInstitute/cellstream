@@ -47,6 +47,7 @@ from cellstream import lock as _lock
 from cellstream import manifest as _manifest
 from cellstream import shm as _shm
 from cellstream import workers as _workers
+from cellstream._dataclass_eq import field_tuple_eq
 from cellstream.errors import ArchiveExistsError, LossyCastError
 from cellstream.v2 import codec
 from cellstream.v2.codec import BYTE_FILTER_SHUFFLE_NAME
@@ -88,6 +89,7 @@ _V2_BITSHUFFLE_CODECS = frozenset(
 _V2_WRITE_OMP_NTHREADS = 4
 
 
+@field_tuple_eq
 @dataclass
 class _GroupedMeta:
     """Metadata needed to plan + write a grouped archive WITHOUT loading X.

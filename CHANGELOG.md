@@ -4,7 +4,7 @@ All notable changes to **cellstream** are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.2] — 2026-08-24
 
 ### Fixed
 
@@ -42,12 +42,49 @@ All notable changes to **cellstream** are documented here. The format is based o
   staleness never occurs. The Rust site cannot be injected from Python; it is covered by its
   existing corrupt-input tests plus verification against a real distributed filesystem.
 
-- **`MatrixSpec.__eq__` returns a bool again on CPython 3.13.** 3.13 generates a pairwise field
-  comparison for dataclasses instead of comparing the two field tuples, which loses the identity
-  shortcut and the bool coercion that `PyObject_RichCompareBool` provided -- so with a sparse
-  matrix or a DataFrame in a field, `==` returned the elementwise result instead of `True`, and
-  anything asking for its truth value raised. Present in 0.9.0 and 0.9.1. This is the "failure in
-  an unrelated subsystem" mentioned under 0.9.1, and it is unrelated to the write path.
+- **Dataclasses holding an array, a sparse matrix or a DataFrame compare correctly again on
+  CPython 3.13.** 3.13 changed what `@dataclass` generates for `__eq__`. Earlier versions built the
+  two field tuples and compared them; 3.13 emits a whole-object `self is other` fast path, an exact
+  class check, and then a pairwise `and` chain over the fields. Two properties of tuple comparison
+  went with the tuple. `PyObject_RichCompareBool`, which it calls per element, tries IDENTITY FIRST
+  -- so a field holding the *same* object on both sides never reached that object's `__eq__` at all
+  -- and its answer is always a bool. An `and` chain does neither: it truth-tests every non-final
+  result, and it hands back a result OBJECT unchanged as soon as one is falsey, or at the end.
+
+  For a field whose `__eq__` returns an array rather than a bool, that is the difference between
+  working and not. Measured with a stock dataclass carrying an array in the next-to-last compared
+  field and one in the last, on **numpy alone**, so that no other dependency is involved:
+
+  | construction | 3.11.13 / 3.12.11 | 3.13.4 |
+  |---|---|---|
+  | next-to-last field is the SAME array object on both sides | `True` | raises `ValueError: The truth value of an array with more than one element is ambiguous` |
+  | next-to-last field: distinct, UNEQUAL one-element arrays | `False`, a bool | `array([False])` |
+  | LAST field: distinct, EQUAL one-element arrays | `True`, a bool | `array([ True])` |
+
+  3.11 and 3.12 behave identically and 3.13 does not, which is what makes this interpreter codegen
+  rather than a dependency. 3.12.11 and 3.13.4 ran the *identical* resolved stack -- numpy 2.5.2,
+  scipy 1.18.0, anndata 0.13.2, pandas 3.0.5 -- so nothing but the interpreter differs between
+  those two. 3.11.13 cannot run that stack at all (scipy 1.18.0 and anndata 0.13.2 both require
+  3.12 or newer), which is exactly why the rows above use numpy and nothing else.
+
+  Five dataclasses in this package hold such a field: `MatrixSpec`, `ShardCSRDLPack`, `ShardPlan`,
+  `MmapBundle` and the writer's internal `_GroupedMeta`. All five now carry an explicit field-tuple
+  `__eq__` that reproduces the pre-3.13 semantics on every supported interpreter -- identity-first
+  per field, always a bool, `NotImplemented` for a foreign class.
+
+  **What this does not change:** comparing two objects whose array-valued fields are DISTINCT
+  objects still compares them elementwise, and still raises whenever that elementwise result has
+  no unambiguous truth value -- which a multi-element array has not, and a one-element array has,
+  as the second row shows. That was true before 3.13 and remains true; it is not a bug and not
+  what this fixes. What was lost and is restored is the shortcut for a field that is the *same*
+  object on both sides -- the case that actually arises here, since each `decompose_anndata` call
+  hands its primary spec the AnnData's own `X` and `var` rather than copies, so corresponding
+  specs from two calls share both.
+
+  Present in 0.9.0 and 0.9.1, and unrelated to the write path -- it is the "failure in an unrelated
+  subsystem" that the 0.9.1 entry below reports without identifying. Note that `spec == spec` on
+  the *identical* object was never affected, thanks to 3.13's whole-object fast path; the failure
+  needs two distinct instances.
 
 - **Two error messages no longer point at a repository you cannot reach.** Opening a legacy
   v1/directory archive, and passing `format="v1"` to `write_sharded`, both answered with a
@@ -56,9 +93,9 @@ All notable changes to **cellstream** are documented here. The format is based o
   never uploaded to PyPI either. Both messages now say what is true instead -- no installable
   release can read such an archive, so re-encode from the original source data with the current
   writer -- and `PackedOnlyError`'s docstring no longer promises an install command it does not
-  carry. The release tooling gained a check that refuses to publish if a non-public repository URL
-  reappears in a shipped file, including one a Python source file assembles from adjacent string
-  literals so that no single line contains it.
+  carry. The tooling that assembles this project's public tree gained a check that refuses to
+  write it if a non-public repository URL reappears in a file that would ship, including one a
+  Python source file assembles from adjacent string literals so that no single line contains it.
 
 ### Changed
 
@@ -79,10 +116,11 @@ All notable changes to **cellstream** are documented here. The format is based o
   It pins the compiler, not the whole build: the Rust crate graph is still resolved at build time,
   so this is a declared toolchain rather than a bit-for-bit reproducible build.
 - **The CPython 3.13 exclusion is lifted; `requires-python` is `>=3.11` again.** 0.9.1's cap rested
-  on the intermittent write failures above being a 3.13 defect. They were not: with the dependency
-  stack held constant and 1500 writes per version, **3.11 failed 20 times, 3.12 8 and 3.13 12, and
-  a local disk zero times on every version** -- 3.11 was the worst arm. Two clean 3.11/3.12 runs at
-  roughly one failure per thousand tests were luck, not a control.
+  on the intermittent write failures above being a 3.13 defect. They were not. Over 1500 writes per
+  arm, **3.11 failed 20 times, 3.12 8 and 3.13 12, and a local disk zero times on every version**
+  -- 3.11 was the worst arm, and the filesystem rather than the interpreter is what predicts a
+  failure. Two clean 3.11/3.12 runs at roughly one failure per thousand tests were luck, not a
+  control.
 
   3.13 has no `bitshuffle` wheel, so installing there builds that sdist; that is a build cost, not
   a failure. **CI now runs 3.11, 3.12 and 3.13** and the classifiers claim all three; the published
@@ -203,6 +241,14 @@ placeholder was uploaded to PyPI in July 2026 to reserve the name and contains n
 
 ### Known limitations
 
+> ⚠️ **This list describes 0.9.0 and is left as the record of what that release shipped.** One of
+> its entries is no longer true of the current release: **CPython 3.13 is supported from 0.9.2**,
+> from the sdist — there is still no cp313 wheel. So the "3.11 or 3.12 is the only supported
+> configuration" bullet below, and its **CPython 3.13** sub-entry, describe 0.9.0 only. Everything
+> else here still holds: the x86_64/SSE4.1 floor, glibc ≥ 2.28, aarch64, Windows, the experimental
+> per-cell format, `layout="shard"`, and `.layers`/`.raw`. See the 0.9.2 entry above for the
+> current platform matrix.
+
 - **The per-cell format (`schema_version` 5 and 6) is experimental and may change.** An archive
   names its codec and schema version in `manifest.json` and a reader raises on either being
   unrecognized, so an incompatible change would take a new name or version and leave existing
@@ -233,5 +279,6 @@ placeholder was uploaded to PyPI in July 2026 to reserve the name and contains n
   (`mudata`) reads belong to that layout, not to the per-cell store.
 - **`.layers` and `.raw` are not stored** by the per-cell layout.
 
+[0.9.2]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.2
 [0.9.1]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.1
 [0.9.0]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.0

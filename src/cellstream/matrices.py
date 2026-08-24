@@ -8,12 +8,13 @@ MatrixSpec, and reassemble the reverse. Matrix keys ARE role strings:
 
 from __future__ import annotations
 
-import operator
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any
 
 import anndata as ad
+
+from cellstream._dataclass_eq import field_tuple_eq
 
 PRIMARY_KEY = "x"
 RAW_KEY = "raw"
@@ -71,6 +72,11 @@ def meta_member_name(key: str) -> str:
     return f"meta/{matrix_dir(key)}.h5ad"
 
 
+# `X` can hold an ndarray or a sparse matrix and `var` a DataFrame -- see
+# `cellstream._dataclass_eq` (#318). With equal multi-element values 3.13's generated __eq__
+# raises here rather than returning a matrix, which is NOT what #318 says; the symptom depends
+# on field order and on the values, so read the module, not the symptom.
+@field_tuple_eq
 @dataclass(frozen=True)
 class MatrixSpec:
     key: str
@@ -79,35 +85,6 @@ class MatrixSpec:
     n_vars: int
     X: Any = None
     var: Any = None
-
-    def __eq__(self, other):
-        """Compare field TUPLES -- what dataclasses generated before CPython 3.13.
-
-        3.13 generates a PAIRWISE field comparison instead of building the two tuples, which loses
-        `PyObject_RichCompareBool`'s identity shortcut AND its bool coercion. With `X` holding a
-        sparse matrix (or `var` a DataFrame) the generated `__eq__` then RETURNS THE ELEMENTWISE
-        MATRIX instead of `True`, and any `bool()` of that raises "The truth value of an array with
-        more than one element is ambiguous". Measured with identical scipy/anndata/pandas:
-
-            MatrixSpec("k", "x", None, 3, m, None) == MatrixSpec("k", "x", None, 3, m, None)
-              3.11 / 3.12 -> True          3.13 -> a 3x3 bool sparse matrix
-
-        Comparing the tuples restores byte-for-byte identical behaviour on every version, including
-        the pre-existing one where two DIFFERENT arrays still raise -- that is not a change here.
-        A class-defined `__eq__` wins over the generated one (`dataclasses._set_new_attribute` does
-        not overwrite), and `__hash__` is still generated because `has_explicit_hash` stays False.
-
-        ⚠️ `read.ShardCSRDLPack`, `grouping.ShardPlan` and `v2.writer._GroupedMeta` have array- or
-        DataFrame-valued compared fields and the same latent problem; none has an observed failure
-        or a test, so they are filed as #318 rather than fixed by a blanket `__eq__` change
-        across four modules.
-        """
-        if other.__class__ is not self.__class__:
-            return NotImplemented
-        return _spec_fields(self) == _spec_fields(other)
-
-
-_spec_fields = operator.attrgetter(*(f.name for f in fields(MatrixSpec)))
 
 
 def decompose_anndata(adata: ad.AnnData) -> list[MatrixSpec]:

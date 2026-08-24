@@ -85,14 +85,21 @@ def test_decompose_rejects_sanitize_collision():
 
 
 def test_matrixspec_eq_returns_a_bool_with_array_valued_fields():
-    """CPython 3.13 generates a PAIRWISE dataclass ``__eq__`` instead of comparing the two field
-    tuples, which loses ``PyObject_RichCompareBool``'s identity shortcut and its bool coercion --
-    so with ``X`` holding a sparse matrix the generated ``__eq__`` returned the elementwise MATRIX
-    and any ``bool()`` of it raised "the truth value of an array ... is ambiguous".
+    """CPython 3.13 emits a whole-object ``self is other`` fast path and then a PAIRWISE ``and``
+    chain over the fields, where earlier versions built and compared the two field tuples. That
+    loses ``PyObject_RichCompareBool``'s per-field identity shortcut AND its bool coercion.
 
-    Asserts ``is True`` / ``is False`` rather than truthiness on purpose: the wrong return is a
-    sparse matrix, which is neither truthy nor falsy but RAISES, so a plain ``assert a == b`` is
-    what let this reach a released version unnoticed on 3.13 while passing on 3.11 and 3.12.
+    ``X`` is ``MatrixSpec``'s PENULTIMATE compared field, so on 3.13 the chain TRUTH-TESTS its
+    result: two distinct specs sharing one sparse ``X`` -- which is what corresponding specs from
+    two ``decompose_anndata`` calls are -- raise "the truth value of an array ... is ambiguous"
+    rather than returning a matrix. A non-bool comes back only from the chain's final field, or
+    from an earlier one whose result is falsey.
+
+    Asserts ``is True`` / ``is False`` rather than truthiness because the restored contract is
+    "always a bool", and a test that only asserted truthiness would pass against a returned array
+    on the ``var`` field. What let this reach a released version was not the assertion style: it
+    was that CI did not run 3.13 at all, which is why permitting 3.13 and adding the 3.13 job
+    landed together.
     """
     m = sp.csr_matrix(np.ones((3, 3), dtype=np.uint16))
     a = mx.MatrixSpec("k", "x", None, 3, m, None)
@@ -106,14 +113,18 @@ def test_matrixspec_eq_returns_a_bool_with_array_valued_fields():
 def test_matrixspec_eq_raises_on_distinct_but_equal_arrays():
     """The deliberate limit of the fix, pinned so a future change to it is a decision, not a drift.
 
-    Two DIFFERENT arrays in the same field raise, because the field's own ``==`` returns an
-    elementwise result that has no truth value. That is what the pre-3.13 tuple comparison did too,
-    so this is not a regression and the fix restores it faithfully rather than papering over it --
-    only the SAME-object case, which used to short-circuit on identity, was broken on 3.13.
+    Two DIFFERENT MULTI-ELEMENT arrays in the same field raise, because the field's own ``==``
+    returns an elementwise result with no unambiguous truth value. (A one-element array HAS one,
+    so distinct one-element arrays do not raise on any version -- the raise comes from ambiguity,
+    not from distinctness.) That is what the pre-3.13 tuple comparison did too, so this is not a
+    regression and the fix restores it faithfully rather than papering over it -- only the
+    SAME-object case, which used to short-circuit on identity, was broken on 3.13.
 
     Gemini (PR #319) proposed making this raise-free by special-casing sparse matrices, arrays and
-    DataFrames. That is new semantics rather than a restoration, and it wants a shared helper across
-    four dataclasses, so it is tracked in #318 instead of decided here.
+    DataFrames. That is new semantics rather than a restoration, so it was declined. The shared
+    helper it also wanted DID land, as ``cellstream._dataclass_eq.field_tuple_eq`` (#318), across
+    five dataclasses -- but it restores the pre-3.13 contract rather than changing it, so this
+    limit is still the deliberate behaviour.
     """
     m1 = sp.csr_matrix(np.ones((3, 3), dtype=np.uint16))
     m2 = sp.csr_matrix(np.ones((3, 3), dtype=np.uint16))
@@ -132,6 +143,7 @@ def test_matrixspec_eq_with_a_dataframe_field():
     b = mx.MatrixSpec("x", "x", None, 2, None, var)
     assert (a == b) is True
     # Differing on an EARLIER field, so the tuple comparison short-circuits before `var`. Two
-    # genuinely different frames in the same field still raise, on every version -- that is
-    # pre-existing behaviour this fix deliberately does not change.
+    # genuinely different frames in the same field still raise on every version, whenever the
+    # elementwise result has no unambiguous truth value -- pre-existing behaviour this fix
+    # deliberately does not change.
     assert (a == mx.MatrixSpec("other", "x", None, 2, None, var)) is False
