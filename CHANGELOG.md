@@ -62,6 +62,22 @@ All notable changes to **cellstream** are documented here. The format is based o
 
 ### Changed
 
+- **The published wheels are built with a pinned Rust toolchain.** The release workflow used to
+  install whatever `stable` was on the day the tag was pushed, from a remote installer script with
+  no checksum -- two moving inputs in the toolchain-install path, in a workflow where every action
+  is pinned to a SHA and the build container is a pinned image. It now names an exact compiler
+  (`rust-toolchain.toml`
+  at the repo root, currently 1.98.0) and fetches a versioned `rustup-init` verified by SHA-256, so
+  the compiler is a declared input of the binary you download rather than a moving one.
+
+  **Installing from the sdist is deliberately NOT pinned.** `rust-toolchain.toml` is excluded from
+  the source archive, so `pip install cellstream` on a platform with no wheel keeps using whatever
+  Rust toolchain your machine already has, exactly as before. (Building from a git checkout does
+  see the pin, since the file is in the repository -- if you build through `rustup`; a system
+  `cargo` ignores the file.) This pin is about the wheels we publish.
+
+  It pins the compiler, not the whole build: the Rust crate graph is still resolved at build time,
+  so this is a declared toolchain rather than a bit-for-bit reproducible build.
 - **The CPython 3.13 exclusion is lifted; `requires-python` is `>=3.11` again.** 0.9.1's cap rested
   on the intermittent write failures above being a 3.13 defect. They were not: with the dependency
   stack held constant and 1500 writes per version, **3.11 failed 20 times, 3.12 8 and 3.13 12, and

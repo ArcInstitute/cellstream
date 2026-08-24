@@ -33,12 +33,77 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # The toolchain VERSION is deliberately not named here. `rust-toolchain.toml` at the repo
+      # ROOT is the single source of truth (#310), and rustup resolves it by walking UP from the
+      # process working directory -- so this step, the `cd rust` gates below and the local
+      # pre-commit hook all get one compiler, PROVIDED the local `cargo` is a rustup proxy. It is
+      # a rustup mechanism: a conda or distribution cargo ignores the file, which is why the
+      # assertion below exists here, where the toolchain is ours to guarantee. `rustup toolchain
+      # install` with no toolchain
+      # argument installs exactly the one that file names, with the components it names; the
+      # runner image ships rustup 1.29.0, which is the version that supports the no-argument form.
+      #
+      # This REPLACES `dtolnay/rust-toolchain@stable`, which was two moving pointers in one line:
+      # the `@stable` BRANCH of a third-party action (a different commit whenever it moves) and
+      # the `stable` CHANNEL it installed. Neither survives a pin, and the runner image already
+      # ships rustup, so nothing the action did is still needed. CARGO_INCREMENTAL, which it also
+      # set, is kept on the step below: incremental artifacts are pure overhead on a cold checkout.
+      - name: Install the pinned Rust toolchain
+        run: |
+          # Observed locally: the channel-manifest download can die with "Connection reset by
+          # peer" and succeed on the immediate retry. A flake here would red-light the whole
+          # matrix, so retry rather than trust one attempt. RUSTUP_MAX_RETRIES covers rustup's
+          # own per-file downloads; the loop covers the rest of the operation.
+          ok=""
+          for attempt in 1 2 3; do
+            if RUSTUP_MAX_RETRIES=10 rustup toolchain install --no-self-update; then ok=1; break; fi
+            echo "::warning::rustup toolchain install failed (attempt ${attempt}) -- retrying"
+            sleep 15
+          done
+          [ -n "${ok}" ] || { echo "FATAL: could not install the pinned Rust toolchain"; exit 1; }
+          rustup show active-toolchain
       - name: Rust fmt + clippy + test
+        env:
+          CARGO_INCREMENTAL: "0"
         run: |
           cd rust
+          # Assert the pin FROM THIS CWD, before using it. This is the one place in the repo where
+          # rustup's walk up from the working directory has to cross a directory boundary -- the
+          # whole reason rust-toolchain.toml sits at the root and not here -- and an un-pinned gate
+          # does not fail, it goes GREEN against a different compiler. That silent divergence IS
+          # #310 (clippy 1.98 red-lit all three jobs on untouched code while the local gate was
+          # still 1.97), so it gets an assertion rather than a comment.
+          #
+          # rustup's own report is the oracle here, NOT a re-parse of the TOML -- an earlier
+          # version of this step scraped `channel = "..."` with sed, which only understood
+          # double-quoted values and would have rejected the equally valid `channel = '1.98.0'`.
+          # Three separate things have to hold, so there are three checks:
+          #   1. the channel resolved to an EXACT X.Y.Z, so `channel = "stable"` -- valid TOML, and
+          #      precisely the thing #310 removes -- fails here;
+          #   2. the file that selected it is the one at the REPO ROOT, matched by its full absolute
+          #      path. A suffix match would also accept `rust/rust-toolchain.toml`, and that is the
+          #      one wrong answer this whole design exists to prevent: a nested file binds THIS step
+          #      (cwd `rust/`) while the pre-commit hook (cwd root) keeps resolving the root one, so
+          #      both could pass while running different compilers. (codex round 2.)
+          #   3. the compiler that will actually run is that version.
+          #
+          # The line is split at the first space and each half checked WHOLE -- `grep -qF` is a
+          # substring search, so a suffix-matched reason would also accept trailing text, and two
+          # separate greps over a multi-line value could match on different lines. `realpath`
+          # rather than `pwd -P`: for a checkout reached through something like `/proc/self/root`,
+          # bash's builtin returns a `//`-prefixed path where rustup canonicalises to a single
+          # leading slash, and that mismatch would REJECT a correct root file. (Both codex round
+          # 3; the `//` case was reproduced before changing this, and ordinary symlinks were fine
+          # either way.)
+          root=$(realpath ..)
+          active=$(rustup show active-toolchain)
+          echo "${active}"
+          printf '%s\n' "${active%% *}" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+(-[^ ]+)?' \
+            || { echo "FATAL: the active toolchain is not an exact X.Y.Z version: ${active}"; exit 1; }
+          [ "${active#* }" = "(overridden by '${root}/rust-toolchain.toml')" ] \
+            || { echo "FATAL: the active toolchain is not the one ${root}/rust-toolchain.toml names: ${active}"; exit 1; }
+          rustc --version --verbose | grep -qxF "release: ${active%%-*}" \
+            || { echo "FATAL: rustc is not ${active%%-*}"; rustc --version --verbose; exit 1; }
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo test
@@ -71,11 +136,11 @@ jobs:
       # someone wrote a rule. That check belongs to whoever is seeding, which is when it matters.
       #
       # `--self-test` is NOT hermetic, and an earlier version of this comment wrongly said so
-      # (codex): besides the fixed-string direction cases it runs the live transforms, checks the
-      # REWRITE templates exist, and calls `git ls-files`. So it can fail on an ordinary change to
-      # a transform landmark or a template path -- which is the point, those are the seed's own
-      # invariants -- but not on merely adding a file. It needs the repo as its cwd, which is what
-      # Actions gives a `run:` step by default.
+      # (codex): besides the fixed-string direction cases it runs the live transforms, checks
+      # that every REWRITE template exists, and calls `git ls-files`. So it can fail on an
+      # ordinary change to a transform landmark or a template path -- which is the point, those
+      # are the seed's own invariants -- but not on merely adding a file. It needs the repo as
+      # its cwd, which is what Actions gives a `run:` step by default.
       - name: Public-seed scanner self-test
         if: hashFiles('scripts/seed_public_repo.py') != ''
         run: python scripts/seed_public_repo.py --self-test

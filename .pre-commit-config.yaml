@@ -34,9 +34,17 @@ repos:
   # failed CI in ~10 s — after the ~45 min the two pytest jobs take to get there.
   #
   # `cargo fmt --check` is ~0.4 s, so it is cheap enough for every commit, and it
-  # is the same Cargo operation CI runs. Note this is equivalence, not a
-  # guarantee: CI installs the moving `stable` toolchain, so a contributor on a
-  # different rustfmt can still disagree with it. Neither is pinned today.
+  # is the same Cargo operation CI runs -- and since #310 it is the same rustfmt
+  # too, IF your `cargo` is a rustup proxy. `rust-toolchain.toml` at the repo root
+  # pins the toolchain and rustup honours it from any working directory under the
+  # root, so this hook and CI then resolve one compiler; a conda or distribution
+  # cargo is not a rustup proxy and ignores the file entirely, so it formats with
+  # whatever rustfmt it ships and can still disagree with CI. That used to be true
+  # of everyone: CI installed the moving `stable` channel, and the gap was not
+  # theoretical -- clippy 1.98 red-lit all three CI jobs on untouched code while
+  # local was still on 1.97. The hook is deliberately NOT changed to force rustup:
+  # `language: system` taking whatever `cargo` is on PATH is what lets a
+  # contributor on a distribution toolchain use it at all. (codex round 4.)
   #
   # `cargo clippy` is deliberately NOT here: it needs a full type-check, which is
   # seconds-to-a-minute after any source edit, and that is too slow for a commit
@@ -62,13 +70,19 @@ repos:
         entry: cargo fmt --manifest-path rust/Cargo.toml --check
         language: system
         # Also the files that decide how rustfmt behaves, not just its input:
-        # Cargo.toml carries the edition, and a rustfmt/toolchain config added
-        # later would otherwise change CI's formatting with no local gate.
+        # Cargo.toml carries the edition, and rust-toolchain.toml decides which
+        # rustfmt runs at all -- so a bump of the pin re-runs this hook rather
+        # than changing CI's formatting with no local gate.
         #
-        # Caveat if a toolchain file is ever added: rustup picks the toolchain
-        # from the process working directory, before cargo sees --manifest-path.
-        # pre-commit runs from the repo root but CI runs after `cd rust`, so a
-        # `rust/rust-toolchain.toml` would bind CI and NOT this hook. Put any
-        # such file at the repo root so both see it.
+        # The caveat this pattern was written for is now a shipped file (#310):
+        # rustup picks the toolchain from the process WORKING DIRECTORY, before
+        # cargo sees --manifest-path. pre-commit runs from the repo root and CI
+        # runs after `cd rust`, so a `rust/rust-toolchain.toml` would bind CI and
+        # NOT this hook. The file therefore lives at the repo ROOT, where rustup's
+        # walk up from either directory finds it; the `(rust/)?` alternative below
+        # is kept so a misplaced copy still triggers the hook. Verified in both
+        # directions -- with the file present both `<root>` and `<root>/rust`
+        # report `1.98.0 (overridden by <root>/rust-toolchain.toml)`, and with it
+        # renamed away both fall back to `stable`.
         files: '^(rust/.*\.rs|rust/Cargo\.toml|(rust/)?\.?rustfmt\.toml|(rust/)?rust-toolchain(\.toml)?)$'
         pass_filenames: false

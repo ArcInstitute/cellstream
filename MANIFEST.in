@@ -1,0 +1,12 @@
+# The sdist's member list comes from setuptools-scm's git file finder, which includes every
+# tracked file. This file subtracts from that list; it never adds.
+#
+# `rust-toolchain.toml` is a development and CI input, not a distribution input (#310). It pins
+# the compiler that builds OUR wheels. Shipping it would impose that exact toolchain on every
+# install that builds from this ARCHIVE -- 3.13, aarch64, macOS, anyone without a wheel -- so a
+# rustup user would pay a toolchain download inside `pip install`, and one who cannot reach
+# static.rust-lang.org would get a hard failure where the build works today. A build from a git
+# checkout through rustup still sees the file and is still pinned (a non-rustup `cargo` ignores it
+# either way); only the sdist is exempt. release.yml asserts
+# the absence, so deleting this line fails the release build rather than silently shipping the pin.
+exclude rust-toolchain.toml

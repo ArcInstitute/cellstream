@@ -111,6 +111,15 @@ name: release
 # Release-path actions are pinned to full commit SHAs, not tags (#306): a tag is a moving
 # pointer, and this is the workflow that signs and uploads artifacts. The comment after each
 # `@sha` records which release it is so a bump is a readable diff.
+#
+# The RUST TOOLCHAIN is pinned the same way (#310) and by the same argument: `rust-toolchain.toml`
+# at the repo root names the exact compiler, and the rustup installer below is fetched by version
+# and verified by SHA-256 rather than piped from a URL that always serves the newest build. Both
+# the compiler and its installer are inputs to the binary this workflow uploads, so both are
+# declared. What is still NOT declared is the crate dependency graph: `rust/Cargo.toml` uses
+# ranged versions and `rust/.gitignore` excludes `Cargo.lock`, so a clean build resolves it
+# afresh (#321). Say "the toolchain is pinned", never "the build is reproducible". (codex round 1.)
+# `pypa/cibuildwheel` remains at v2.21.3 on purpose -- see the note on that pin, and #322.
 on:
   push:
     # `v[0-9]*`, not `v*`: a tag like `v` or `version-test` would otherwise reach the release
@@ -138,6 +147,22 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # setuptools-scm derives the version from tags
+      # THE cibuildwheel PIN IS HELD DELIBERATELY, and this is the note the header points at.
+      # v2.21.3 is two majors behind current (v4.2.0 as of 2026-08-22). It stays because this is
+      # the ONLY cibuildwheel configuration that has ever produced a working wheel in this repo --
+      # the workflow was red on every run before #304 -- and because the majors move the parts
+      # this job depends on:
+      #   * 3.0 switched the default build frontend from `pip wheel` to `build` and stopped
+      #     preinstalling setuptools/wheel in the build environment;
+      #   * 3.0 also made manylinux_2_28 the default linux image, which would make the
+      #     CIBW_MANYLINUX_X86_64_IMAGE line below redundant rather than load-bearing;
+      #   * 4.0 added an `abi3audit` pass after the repair step -- a new way for a good wheel to
+      #     be rejected.
+      # The step-ordering claim under CIBW_TEST_COMMAND cites LINE NUMBERS in v2.21.3's linux.py
+      # and is only true for this pin; re-verify it on any bump. A bump therefore wants its own
+      # PR and its own `workflow_dispatch` run, not a ride along an unrelated change: two changes
+      # in one dispatch make a red run ambiguous. #310 raised the bump alongside the toolchain
+      # pin and it was deliberately split out (Alex, 2026-08-22); it is tracked as #322.
       - uses: pypa/cibuildwheel@7940a4c0e76eb2030e473a5f864f291f63ee879b # v2.21.3
         env:
           CIBW_BUILD: "cp311-* cp312-*"
@@ -146,9 +171,80 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_ARCHS_LINUX: x86_64
           CIBW_SKIP: "*-musllinux_*"
-          # --proto '=https' --tlsv1.2 matches the toolchain install line in README.md; this
-          # snippet gets copied verbatim into CI, so harden it here.
-          CIBW_BEFORE_ALL_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+          # #310. Two unpinned things used to share this one line: the rustup INSTALLER (a
+          # remote script piped straight into a shell, with no checksum) and the TOOLCHAIN it
+          # installed (`stable` -- whatever that was on the day the tag was pushed). They were
+          # the last unpinned parts of the TOOLCHAIN in the path that produces the published
+          # wheels, sitting next to SHA-pinned actions and a pinned manylinux image -- but not
+          # the last unpinned INPUTS; see the note in the header about the crate graph. Both are
+          # now declared:
+          #
+          #   * rustup-init 1.29.0 from the VERSIONED archive path, checked against its published
+          #     SHA-256 before it is executed. Note what sh.rustup.rs actually serves: a BOOTSTRAP
+          #     SHELL SCRIPT which, with no `RUSTUP_VERSION` in the environment, then downloads
+          #     `rustup-init` from `.../rustup/dist/<arch>/` -- a moving path. Checksumming that
+          #     URL would therefore pin the bootstrap bytes and not the executable they fetch;
+          #     `.../rustup/archive/1.29.0/<arch>/rustup-init` plus a hash of the binary pins the
+          #     thing that actually runs. The old piped form verified neither. (codex round 4.)
+          #   * `--default-toolchain none`, so the installer brings NO compiler, and
+          #     `rustup toolchain install` (no argument == the active toolchain) then installs
+          #     exactly the one that rust-toolchain.toml at the project root names, with the
+          #     components it names. `--no-self-update` keeps rustup itself at the pinned 1.29.0
+          #     rather than letting it upgrade mid-build and undo half the pin.
+          #
+          # This FAILS CLOSED, which is the property worth having: with no default toolchain
+          # anywhere in the container, a lost or unreadable rust-toolchain.toml makes rustup
+          # refuse outright ("could not choose a version of rustc to run"), so the build dies
+          # instead of quietly falling back to `stable`. Verified by rehearsing this exact chain
+          # against a throwaway HOME, negative control included.
+          #
+          # `pwd && ls -l rust-toolchain.toml` is diagnostics, not decoration: the file is
+          # resolved from the working directory, so if cibuildwheel ever stops running before_all
+          # at the project root the log says which directory it was in and `ls` names the file it
+          # could not find, instead of a bare non-zero from rustup.
+          #
+          # The last three clauses ASSERT rather than print, and the release path needs its own
+          # assertion because it is decoupled from `tests`: a tag push runs this workflow and not
+          # that one, so the stricter check over there is never reached. `rustup show
+          # active-toolchain` is the oracle. Its output proves the channel resolved to an EXACT
+          # X.Y.Z (a `channel = "stable"` fails), and that the file which selected it is the one at
+          # the project root -- matched by full absolute path, because a suffix match would also
+          # accept a nested `rust/rust-toolchain.toml` (codex round 2). The final clause confirms
+          # the rustc that will build the extension really is that version. Merely printing
+          # `rustc --version`, as the first draft did, would have kept the whole wheel job green
+          # against a re-floated channel. (codex round 1.)
+          #
+          # The line is split at the first space and each half compared WHOLE, because `grep -F`
+          # is a substring search (codex round 3). `pwd -P` here and `realpath` in test.yml, and
+          # the asymmetry is deliberate: a shell's `pwd -P` can return a `//`-prefixed path where
+          # rustup canonicalises to a single slash, but that needs a cwd reached through something
+          # like `/proc/self/root`, and this cwd is the container's own `/project` -- a plain path
+          # with no symlink and no `//` to normalise, printed two clauses earlier so the log proves
+          # it. test.yml's cwd is a checkout path this workflow does not control, so it pays for
+          # `realpath`; here the argument holds without adding a binary to the one configuration
+          # that has ever produced a working wheel in this repo.
+          #
+          # NB README.md's source-build guidance still tells a reader to install a toolchain the
+          # ordinary way, correctly: that is someone building FROM THE SDIST, which this pin
+          # deliberately does not govern -- rust-toolchain.toml is excluded from the archive (see
+          # MANIFEST.in). Worded generically because this workflow and README.md BOTH travel
+          # verbatim to the public repo (#324), so this explanation must be correct when read
+          # from either checkout. A build from a git CHECKOUT through rustup is pinned, because
+          # the file is present there; a non-rustup `cargo` ignores the file in every case.
+          CIBW_BEFORE_ALL_LINUX: >-
+            curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-connrefused
+            https://static.rust-lang.org/rustup/archive/1.29.0/x86_64-unknown-linux-gnu/rustup-init
+            -o /tmp/rustup-init &&
+            echo '4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10  /tmp/rustup-init'
+            | sha256sum -c - &&
+            chmod +x /tmp/rustup-init &&
+            /tmp/rustup-init -y --profile minimal --default-toolchain none &&
+            pwd && ls -l rust-toolchain.toml &&
+            RUSTUP_MAX_RETRIES=10 "$HOME/.cargo/bin/rustup" toolchain install --no-self-update &&
+            tc=$("$HOME/.cargo/bin/rustup" show active-toolchain) && echo "$tc" &&
+            printf '%s\n' "${tc%% *}" | grep -qxE '[0-9]+\.[0-9]+\.[0-9]+(-[^ ]+)?' &&
+            [ "${tc#* }" = "(overridden by '$(pwd -P)/rust-toolchain.toml')" ] &&
+            "$HOME/.cargo/bin/rustc" --version --verbose | grep -qxF "release: ${tc%%-*}"
           # PIP_ONLY_BINARY=:all: ENFORCES the all-wheel policy the comments above claim.
           # Without it a future dependency could drop its 2_28 wheel, compile from sdist inside
           # the container, and leave this workflow GREEN while the stated policy was violated --
@@ -230,6 +326,29 @@ jobs:
           # vendor directory fails.
           grep -qE '/rust/vendor/.+\.(h|hpp|cpp|cc)$' /tmp/sdist.list \
             || { echo "FATAL: sdist carries no vendored FastPFor sources"; exit 1; }
+          # The one member that must be ABSENT (#310). rust-toolchain.toml pins the compiler that
+          # builds OUR wheels; MANIFEST.in keeps it out of the archive so a build FROM THE SDIST on
+          # a machine we do not control keeps using whatever otherwise-compatible rustc that
+          # machine already has. (A build from a git checkout through rustup sees the file and is
+          # pinned; only the archive is exempt.) Shipping it would turn a soft dependency into a
+          # hard one -- a rustup user
+          # would pay a toolchain download inside `pip install`, and one who cannot reach
+          # static.rust-lang.org would get a hard failure where the build works today. An
+          # exclusion nothing checks is an exclusion that silently stops applying, so it is
+          # asserted here rather than trusted to MANIFEST.in staying put.
+          #
+          # Written as an explicit three-way on grep's exit code, not `! grep ... || fail`: the
+          # negated form maps BOTH "no match" (1) and "grep itself failed" (>1, e.g. an unreadable
+          # list) to success, so this one assertion -- alone among the checks in this step -- would
+          # have failed OPEN. The positive greps above fail closed on the same error for free.
+          # (codex round 1.)
+          grep_rc=0
+          grep -qE '(^|/)rust-toolchain\.toml$' /tmp/sdist.list || grep_rc=$?
+          case "${grep_rc}" in
+            0) echo "FATAL: sdist carries rust-toolchain.toml; MANIFEST.in should exclude it"; exit 1 ;;
+            1) ;;
+            *) echo "FATAL: grep failed (rc=${grep_rc}) reading /tmp/sdist.list"; exit 1 ;;
+          esac
           echo "sdist contents OK ($(wc -l < /tmp/sdist.list) members)"
       # The sdist is what a non-wheel platform actually gets, so install it the way they will.
       # SCOPE: one configuration -- Ubuntu, cp311, x86_64. It proves the archive builds a

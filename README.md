@@ -91,15 +91,20 @@ pip install cellstream
 | `mudata` | `mudata` | the [legacy shard layout](#legacy-the-shard-layout) only — multi-modal reads are a feature of that layout, not of the per-cell store. |
 | `gpu` | `cupy-cuda12x`, `nvidia-nvcomp-cu12` | likewise legacy-layout only: on-GPU decode of shard archives. |
 
-⚠️ Neither `test` nor `dev` pulls `pyfastpfor`, so a bare `.[dev]` **silently skips** every
-per-cell test on the pure-Python engine — install `.[dev,cell]`. CI installs `.[test,cell]` for
-exactly this reason. `pre-commit` is not an extra at all: `pip install pre-commit` separately.
+⚠️ Neither `test` nor `dev` pulls `pyfastpfor`, so a bare `.[dev]` **silently skips almost all of
+`tests/cell`** — install `.[dev,cell]`. The one module that still runs, `test_pyfastpfor_optional.py`,
+is exempt on purpose: it proves the layout works *without* the extra, so it covers zstd archives and
+the error a pfordelta read raises. What a bare install cannot exercise is a *successful* pure-Python
+pfordelta decode, which is most of the per-cell surface. CI installs `.[test,cell]` for exactly this
+reason. `pre-commit` is not an extra at all: `pip install pre-commit` separately.
 
 ### Platform support, and building from source
 
 **Supported: Linux x86_64 with SSE4.1, glibc ≥ 2.28, on CPython 3.11, 3.12 or 3.13.** The
-**wheels** cover 3.11 and 3.12; 3.13 is supported and tested but installs from the sdist. Other
-platforms build from source and are not claimed.
+**wheels** cover 3.11 and 3.12. 3.13 is supported and tested on `main`, and will install from the
+sdist **from the next release onward** — the released 0.9.1 carries a `<3.13` cap and cannot be
+installed there at all, sdist or otherwise. See **CPython 3.13** below. Other platforms build from
+source and are not claimed.
 
 The SSE4.1 requirement is real but **not expressed by the wheel tag** — `manylinux_2_28_x86_64` is
 a glibc statement. The vendored FastPFor is compiled with `-msse4.1` and the shim asks for
@@ -115,8 +120,9 @@ grep -q sse4_1 /proc/cpuinfo && echo "SSE4.1: yes" || echo "SSE4.1: NO — the w
 sysctl machdep.cpu.features 2>/dev/null | grep -qi 'sse4\.1' && echo "SSE4.1: yes" || echo "SSE4.1: NO"
 ```
 
-Where no wheel is published for your platform, `pip install cellstream` falls back to the sdist
-and builds from source.
+Where no wheel is published for your platform, `pip install cellstream` falls back to the sdist and
+builds from source — provided the release supports your interpreter at all. A `requires-python` cap
+is refused before any sdist is considered, which is exactly what 0.9.1 does on 3.13.
 
 **CPython 3.13.** 0.9.1 excluded it, on the strength of intermittent per-cell write failures that
 were read as a 3.13 defect. They were not one — a path `stat()` on a distributed filesystem can
@@ -129,8 +135,13 @@ bug. Two things to know in the meantime:
   because every *functional* release before the fix carries that bug on a distributed filesystem
   whatever the Python version, 0.0.1 because it is a name placeholder with no working code. A yank is a soft signal, so an *exact* pin such as `pip install cellstream==0.9.0`
   still installs; that is unsupported.
-- 3.13 has no `bitshuffle` wheel, so installing there builds that sdist as well as this one. CI
-  runs 3.11, 3.12 and 3.13, and the classifiers claim all three.
+- Once that release lands, a 3.13 install will build **two** sdists, not one: 3.13 has no
+  `bitshuffle` wheel either. Until then an *unpinned* `pip install cellstream` builds nothing there
+  — the cap is refused before any sdist is fetched. What *does* resolve there is not equivalent: an
+  exact pin to any **yanked** release (`==0.9.0`, or the `==0.0.1` placeholder) predates the cap but
+  also predates the fix, and is **unsupported**; a VCS install from this repository's default branch
+  **carries the fix** and is simply not a release yet. CI already runs 3.11, 3.12 and 3.13, and the
+  classifiers claim all three.
 
 Note what a source build does **not** buy you: a wheel tag cannot express an ISA
 requirement, so on an x86_64 machine without SSE4.1 pip takes the *wheel* and the fault above still
@@ -162,11 +173,9 @@ than leaving you to discover them:
 | **aarch64**, including Apple Silicon | **Unsupported.** The crate compiles, but the per-cell code path does not exist there: `rust/src/cell.rs` is `#![cfg(target_arch = "x86_64")]`, because the vendored FastPFor is x86 SIMD. So `cellstream.rust_available()` is `False` and a per-cell read raises unless you set `CELLSTREAM_ALLOW_PYTHON_FALLBACK=1`. With that opt-in, a **zstd** archive does decode in pure Python and needs no extra — but **pfordelta**, the default codec for integer counts, has no working backend: its pure-Python path needs `pyfastpfor`, which is itself a binding to the same x86 FastPFor. |
 | **Windows** | **Unsupported**, and not merely untested: `import cellstream` fails outright, because `cellstream/lock.py` imports `fcntl` at module scope. |
 
-**Development install**
+**Development install** — from a checkout of this repository:
 
 ```bash
-git clone https://github.com/ArcInstitute/cellstream.git
-cd cellstream
 pip install -e ".[dev,cell,mudata]"     # or: uv pip install -e ".[dev,cell,mudata]"
 pytest tests/
 ```
@@ -487,10 +496,12 @@ leave existing archives readable.
 ## Contributing, and what is open
 
 Issues and pull requests are welcome. `pip install -e ".[dev,cell,mudata]"` and `pytest tests/` is
-the whole loop; `pip install pre-commit && pre-commit install` adds the `ruff` and `cargo fmt`
-gates CI enforces (`pre-commit` is not one of the extras). The test
-suite runs under both engines — the Rust core and, with `CELLSTREAM_DISABLE_RUST=1`, the pure-Python
-fallback — and a change to either path is expected to keep both green.
+the Python loop; `pip install pre-commit && pre-commit install` adds the `ruff` and `cargo fmt`
+gates CI enforces (`pre-commit` is not one of the extras). A change under `rust/` has two more that
+only CI runs — `cargo clippy --all-targets -- -D warnings` and `cargo test`, both from inside
+`rust/` — so it is worth running those locally before you push. The test suite runs under both
+engines — the Rust core and, with `CELLSTREAM_DISABLE_RUST=1`, the pure-Python fallback — and a
+change to either path is expected to keep both green.
 
 cellstream first became public in 0.9.0, after a substantial private development history, so
 expect open ends: the per-cell format is marked experimental for a reason, and correctness work on

@@ -1,0 +1,63 @@
+# The Rust toolchain that builds this crate, pinned (#310).
+#
+# WHY THIS FILE IS AT THE REPO ROOT AND NOT UNDER rust/
+# ----------------------------------------------------
+# rustup picks the toolchain from the PROCESS WORKING DIRECTORY -- walking up through parent
+# directories -- before cargo ever sees `--manifest-path`. The three callers run from two
+# different places:
+#
+#   .github/workflows/test.yml    `cd rust` then `cargo fmt --check`      cwd = <root>/rust
+#   .pre-commit-config.yaml       `cargo fmt --manifest-path rust/...`    cwd = <root>
+#   setup.py / setuptools-rust    `cargo build --manifest-path rust/...`  cwd = <root>
+#
+# At the root all three resolve it. Under `rust/` it would bind CI and NOT the pre-commit hook,
+# which is the trap already recorded in .pre-commit-config.yaml -- and a local gate running a
+# different compiler from CI is the exact failure this file exists to remove.
+#
+# WHY AN EXACT VERSION AND NOT `stable`
+# -------------------------------------
+# `stable` is why this file exists. clippy 1.98 red-lit all three CI jobs on code the pull
+# request had not touched, while the local `cargo fmt`/clippy gate was still on 1.97: the two
+# gates were silently not the same gate, and nothing in the repo said so. An exact channel makes
+# the compiler a declared input of the published wheels rather than "whatever stable was on the
+# day the tag was pushed". release.yml pins every action to a commit SHA and builds in a pinned
+# manylinux_2_28 image; the toolchain was the last unpinned part of the TOOLCHAIN in that path.
+#
+# It is NOT the last unpinned input to the binary, and #310 said otherwise: `rust/Cargo.toml`
+# declares ranged dependencies and `rust/.gitignore` excludes `Cargo.lock`, as is conventional
+# for a library crate, so every clean build still resolves the crate graph afresh. Pinning that
+# too means tracking the lockfile and building `--locked`, which also changes what the sdist
+# carries -- a separate change with its own verification, filed as #321 rather than smuggled in
+# here. Say "the toolchain is pinned", never "the build is reproducible". (codex round 1.)
+#
+# NOT IN THE SDIST
+# ----------------
+# MANIFEST.in excludes this file and release.yml asserts it is absent from the archive, so a
+# build FROM THE SDIST -- which is what `pip install cellstream` does on a platform with no wheel
+# -- keeps using whatever otherwise-compatible rustc that machine already has. Pinning our own
+# artifacts is reproducibility; pinning someone else's build turns a soft dependency (any recent
+# enough rustc) into a hard one -- an air-gapped or proxied rustup user whose build works today
+# would start failing on a toolchain download.
+#
+# Note the scope precisely. A GIT CHECKOUT is the other case, and it IS pinned -- the file is
+# right there, so `pip install .` and `pip install -e .` from a clone, which is what CI and a
+# contributor both do, use the pinned compiler. That is the intent. But it is a RUSTUP mechanism:
+# a distribution `cargo`/`rustc` that is not a rustup proxy ignores this file completely and
+# builds with itself. So: a checkout built through rustup is pinned; the sdist never is.
+#
+# BUMP CADENCE
+# ------------
+# Nothing bumps this automatically -- this repository has no Dependabot configuration at all, and
+# nothing proactively reports that the pin has gone stale. (It is not inert forever: the crate
+# graph is unlocked, so a dependency that raises its own `rust-version` past this channel would
+# break the build on a day nothing here changed. See #321.) Bump it deliberately, in its own PR,
+# when a newer
+# toolchain is wanted (a clippy lint, a language feature, a soundness fix) and otherwise once a
+# quarter so the pin never drifts far enough that the bump is itself a project. A bump changes
+# how the shipped binary is produced, so the bump PR must re-run `release.yml` by
+# `workflow_dispatch` and confirm the wheels job is green -- a green `tests` run does not cover
+# the manylinux container.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
