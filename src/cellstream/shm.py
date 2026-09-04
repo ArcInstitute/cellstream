@@ -1,7 +1,12 @@
 """SharedMemory allocation and lifecycle for the parallel read path.
 
-Workers ATTACH and close() shm; only the parent unlinks. Lifecycle:
-  parent allocates → fork → workers attach and write → workers close →
+Workers ATTACH and close() shm; only the parent unlinks. The lifecycle below is
+the SPAWNED pure-Python arm; a single-shard read runs the same ATTACHING worker
+inline, so it skips the spawn but not the attach. The Rust engine fills a
+parent-allocated bundle in-process instead: a dense output it writes directly,
+and for CSR it writes the data/indices streams while the parent casts the indptr
+into the bundle.
+  parent allocates → spawn → workers attach and write → workers close →
   parent constructs AnnData with views → weakref finalizer on AnnData
   unlinks the /dev/shm names (mappings remain valid) → SharedMemory
   python objects naturally GC when no view references them, which then
@@ -564,9 +569,10 @@ def attach_mudata_close(mdata, adatas) -> None:
     MuData holds no shm bundles of its own (its global obs/obsm/uns/obsp/varp are
     heap from the header); its families' bundles live on the per-modality AnnData,
     each already ``attach_buffer_cleanup_multi``-attached and held BY REFERENCE in
-    ``mdata.mod``. GC already frees them (each AnnData carries its own finalizer);
-    this only adds an explicit combined close for parity with
-    ``adata.close_shared_memory()``.
+    ``mdata.mod``. GC alone already unlinks their /dev/shm NAMES (each AnnData
+    carries its own finalizer), but a segment that an array still references stays
+    MAPPED until that reference is dropped; this adds the explicit combined release,
+    for parity with ``adata.close_shared_memory()``.
     """
     closers = [a.close_shared_memory for a in adatas if hasattr(a, "close_shared_memory")]
 

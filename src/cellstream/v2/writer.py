@@ -9,13 +9,14 @@ this is the staging step that outlived it.
 
 Reuses v0.1's lock / manifest / header machinery via cellstream.lock,
 cellstream.manifest, cellstream.header. The per-shard encode step is the only
-new code — it streams the shard's data/indices/indptr through
-v2.codec.bitshuffle_zstd_encode in chunk-sized blocks and emits an .shx
-file via v2.format.write_shx_file_streaming.
+new code — it streams the shard's data/indices/indptr through the v2 codec
+(byte-filter by default; the legacy bitshuffle codec when a name selects it) in
+chunk-sized blocks and emits an .shx file via v2.format.write_shx_file_streaming.
 
 Its worker pools are **spawn** pools, built here with mp.get_context("spawn"); from
-cellstream.workers it takes only omp_nthreads_in_env (bitshuffle's OMP_NUM_THREADS window,
-whose lock is shared with the v2 reader) and _maybe_test_kill_self. The v0.1 *fork*-pool
+cellstream.workers it takes only omp_nthreads_in_env (the OMP_NUM_THREADS window that bounds
+bitshuffle's OpenMP pool in the workers, whose lock is shared with the v2 reader) and
+_maybe_test_kill_self. The v0.1 *fork*-pool
 machinery this docstring used to claim it reused went with the v1 writer in #154.
 
 The ENCODER is incremental: ``_encode_shard_streams`` works in
@@ -565,7 +566,7 @@ def write_v2_multi(
             # Derive the PRIOR family DIRS from the old manifest's stored
             # shard_filename_template (its resolved "<dir>/..." token), NOT by
             # re-deriving matrix_dir(key): a prior key written by a newer writer
-            # (e.g. a Plan-2 "modality:*") may not be a key matrix_dir() recognises,
+            # (e.g. a "modality:*" family) may not be a key matrix_dir() recognises,
             # and matrix_dir() would raise ValueError and crash the overwrite. The
             # manifest already stores the resolved path (design decision: readers
             # never re-derive dirs), so using it cleans any prior family robustly.
@@ -1324,7 +1325,8 @@ def _write_v2_inmem(
                                 idt.name,
                             )
                         )
-                    # spawn (not fork): bitshuffle/OpenMP deadlocks on fork-after-import.
+                    # spawn (not fork): a parent that has imported bitshuffle (any
+                    # non-empty legacy-codec call) deadlocks the child on fork-after-import.
                     ctx = mp.get_context("spawn")
                     # Bound OMP_NUM_THREADS in the parent for the executor's lifetime so
                     # spawn workers don't oversubscribe (held across submit+as_completed
@@ -1332,7 +1334,7 @@ def _write_v2_inmem(
                     with _workers.omp_nthreads_in_env(write_nthreads):
                         # Cap workers at n_shards (== len(inputs)): a write with
                         # n_workers > n_shards shouldn't spawn idle interpreters
-                        # (~0.5-1 s startup + a bitshuffle import each). Mirrors
+                        # (~0.5-1 s of interpreter startup each). Mirrors
                         # reader_cpu's max_workers=min(n_workers, len(inputs)).
                         ex = ProcessPoolExecutor(
                             max_workers=min(n_workers, n_shards), mp_context=ctx

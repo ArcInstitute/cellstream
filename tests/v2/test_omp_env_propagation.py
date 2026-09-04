@@ -1,12 +1,17 @@
-"""Regression test for the load-bearing OMP_NUM_THREADS env-propagation fix.
+"""Regression test for the OMP_NUM_THREADS env-propagation mechanism.
 
-The v0.2 reader_cpu sets OMP_NUM_THREADS in the parent's env
-BEFORE Pool() creation, so spawn workers inherit it at execve and
-bitshuffle sees the right value at first import. The original bug was
-to use Pool(initializer=_init_omp_threads) which silently failed
-because the initializer pickle pulls in reader_cpu, which imports
-bitshuffle, which initializes OpenMP with os.cpu_count() BEFORE the
-initializer runs.
+The v2 reader_cpu sets OMP_NUM_THREADS in the parent's env BEFORE the executor is
+created, so spawn workers inherit it at execve and bitshuffle sees the right value
+whenever it is first imported in the worker. The original bug (v0.2) was to use
+Pool(initializer=_init_omp_threads), which silently failed because at the time the
+initializer pickle pulled in reader_cpu, which imported bitshuffle at module scope,
+which initialised OpenMP with os.cpu_count() BEFORE the initializer ran.
+
+That ordering is history since #305: v2/codec.py imports bitshuffle lazily, inside the
+legacy codec, so a worker's bootstrap no longer imports it and an initializer would
+now run first. The parent-env mechanism was kept regardless, and these tests verify
+IT -- the worker below imports bitshuffle inside its task, which is exactly when the
+lazy import now happens.
 """
 
 from __future__ import annotations
@@ -68,14 +73,16 @@ def _spawn_worker_observe_omp_after_bitshuffle_import(_):
 
 
 def test_bitshuffle_import_observes_parent_omp_env():
-    """The actual regression: workers must see OMP_NUM_THREADS=X at the moment
-    they import bitshuffle. This is the load-bearing case that broke when
-    Pool(initializer=...) was tried instead of parent-env-setting.
+    """Workers must see OMP_NUM_THREADS=X at the moment they import bitshuffle --
+    which, since #305, is inside a task on the first non-empty legacy-codec call.
+    The worker helper models that timing by importing bitshuffle directly inside
+    its task. Historically this was the
+    load-bearing case: it broke when Pool(initializer=...) was tried instead of
+    parent-env-setting, because bitshuffle was then imported during worker
+    bootstrap, before any initializer.
 
     The previous test (test_omp_num_threads_inherited_by_spawn_workers) only
-    verified env visibility — it doesn't import bitshuffle in the worker, so it
-    couldn't catch the regression where the initializer ran AFTER bitshuffle's
-    import.
+    verifies env visibility -- it doesn't import bitshuffle in the worker.
     """
     target = "5"
     prev = os.environ.get("OMP_NUM_THREADS")

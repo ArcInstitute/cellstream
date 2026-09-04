@@ -1,7 +1,7 @@
 name: release
 
-# Builds the release artifacts -- cp311/cp312 manylinux_2_28 x86_64 wheels plus an sdist -- and
-# publishes them to PyPI on a pushed `v*` tag.
+# Builds the release artifacts -- cp311/cp312/cp313 manylinux_2_28 x86_64 wheels plus an sdist --
+# and publishes them to PyPI on a pushed `v*` tag.
 #
 # PUBLICATION IS A SEPARATE, GATED JOB (#306), never a step appended to the build:
 #   * `needs:` the build jobs, so nothing publishes that has not passed the rust-availability
@@ -24,9 +24,9 @@ name: release
 # from platforms it never supported, so state it exactly:
 #
 #   SUPPORTED: Linux x86_64 with SSE4.1, glibc >= 2.28 (the manylinux_2_28 baseline), CPython
-#   3.11 to 3.13. The WHEELS cover cp311 and cp312; 3.13 is supported and CI-tested but installs
-#   from the sdist. Keep those two facts separate -- conflating them is what made the block below
-#   wrong for months.
+#   3.11 to 3.13. The WHEELS cover cp311, cp312 and cp313 (cp313 since #305, below). Keep
+#   language support and wheel coverage as two separate facts even now that they coincide --
+#   conflating them is what made the block below wrong for months.
 #
 #   The SSE4.1 part is NOT expressed by the wheel tag -- `manylinux_2_28_x86_64` is a glibc
 #   statement only. `rust/build.rs` compiles the vendored FastPFor with `-msse4.1` and
@@ -61,11 +61,14 @@ name: release
 # reads are much slower with no indication: setup.py declares the extension non-optional, so a
 # missing toolchain FAILS LOUDLY (#244).
 #
-# A cp313 WHEEL is deliberately absent, and the reason is now the original one and only that one:
-# `bitshuffle` publishes no cp313 wheel, so a cp313 build cannot offer the ALL-WHEEL dependency
-# install this workflow's PIP_ONLY_BINARY=:all: policy requires. That is #305's actual subject --
-# move bitshuffle to an extra with a lazy import, wait for an upstream cp313 wheel, or relax the
-# policy.
+# The cp313 WHEEL was absent until #305, for one reason: `bitshuffle` publishes no cp313 wheel, so
+# a cp313 build could not offer the ALL-WHEEL dependency install this workflow's
+# PIP_ONLY_BINARY=:all: policy requires. #305 took the first of its three options -- bitshuffle is
+# now the optional `bitshuffle` extra, imported lazily by the legacy codec alone -- so a default
+# install has no dependency without a cp313 wheel, `cp313-*` joined CIBW_BUILD, and the
+# CIBW_TEST_COMMAND below asserts that importing the wheel never reaches bitshuffle. (Upstream is
+# dormant -- 0.5.2 from 2024-09, its py3.13 issue open since 2025-10 -- so "wait" was not a plan,
+# and the policy stays.)
 #
 # The SECOND blocker recorded here for a while -- an undiagnosed non-deterministic suite failure on
 # 3.13, which 0.9.1 acted on by capping `requires-python` at <3.13 -- is GONE, and the diagnosis
@@ -99,10 +102,11 @@ name: release
 # not have been a dishonest artifact -- a manylinux tag promises the compatibility of that
 # wheel's OWN native code, not that every dependency resolves. Resolution is a separate question.
 #
-# The cp311/cp312 x86_64 wheels we actually consume from bitshuffle and zstandard are
-# manylinux_2_17, and that is fine: an older-baseline wheel installs on a newer system. Only the
-# reverse breaks, and nothing in the dependency set requires BUILDING in a 2_17 environment.
-# (Scoped deliberately -- zstandard's newer-interpreter wheels do carry 2_28.)
+# The cp311/cp312 x86_64 wheels we actually consume from zstandard are manylinux_2_17, and that
+# is fine: an older-baseline wheel installs on a newer system. Only the reverse breaks, and
+# nothing in the dependency set requires BUILDING in a 2_17 environment. (Scoped deliberately --
+# zstandard's newer-interpreter wheels do carry 2_28. bitshuffle used to be named here too; since
+# #305 the wheel build never installs it.)
 #
 # NOT verified locally: the docker socket on the dev host rejects non-root
 # (`permission denied ... /var/run/docker.sock`), so `cibuildwheel --platform linux` cannot run
@@ -141,7 +145,7 @@ permissions:
 
 jobs:
   wheels:
-    name: wheels (cp311, cp312, manylinux_2_28 x86_64)
+    name: wheels (cp311, cp312, cp313, manylinux_2_28 x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -165,7 +169,7 @@ jobs:
       # pin and it was deliberately split out (Alex, 2026-08-22); it is tracked as #322.
       - uses: pypa/cibuildwheel@7940a4c0e76eb2030e473a5f864f291f63ee879b # v2.21.3
         env:
-          CIBW_BUILD: "cp311-* cp312-*"
+          CIBW_BUILD: "cp311-* cp312-* cp313-*"
           # THE #297 FIX. See the header. Available on this action pin: v2.21.3's
           # pinned_docker_images.cfg already lists manylinux_2_28_x86_64:2024.10.07-1.
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
@@ -261,8 +265,19 @@ jobs:
           # also why `if: always()` on the upload step cannot deliver the inspectability it
           # looks like it offers, and was tried and REVERTED in #304. (Those line numbers hold
           # ONLY for the pin above and must be re-checked if it moves. Copilot, #304.)
+          #
+          # The second clause is #305's guard: the default install must never reach `bitshuffle`.
+          # Three regressions, three different catchers, and this assert is the third:
+          #   * an eager `import bitshuffle` creeping back into the package, with the extra still
+          #     absent from this test environment -- `import cellstream` itself fails, before the
+          #     assert ever runs;
+          #   * bitshuffle back in `dependencies` -- on cp313 PIP_ONLY_BINARY refuses the install,
+          #     since it has no wheel to offer;
+          #   * BOTH at once, on cp311/cp312 -- the wheel installs, the eager import succeeds, and
+          #     nothing above notices. Only this assert does, and it names the regression. (codex.)
           CIBW_TEST_COMMAND: >-
-            python -c "import cellstream; s = cellstream.rust_status(); assert s['available'], s"
+            python -c "import sys, cellstream; s = cellstream.rust_status(); assert s['available'], s;
+            assert 'bitshuffle' not in sys.modules, 'the default install imported bitshuffle (#305)'"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: success()
         with:
@@ -454,8 +469,8 @@ jobs:
           # Every artifact must carry THIS version. Without it a stray `cellstream-0.9.3-*.whl`
           # with no `+` passes every other check here and gets uploaded alongside the 0.9.2 sdist.
           # This is a version-agreement check only -- it deliberately does NOT re-check the exact
-          # cp311/cp312 ABI set or the cardinality. `validate` owns that policy for the path that
-          # reaches PyPI, and a third copy of that loop would trade a rehearsal-index check for
+          # cp311/cp312/cp313 ABI set or the cardinality. `validate` owns that policy for the path
+          # that reaches PyPI, and a third copy of that loop would trade a rehearsal-index check for
           # exactly the divergence risk this file already guards against. (codex round 4.)
           # `files` is re-collected HERE: every `run:` block is its own shell, so the array the
           # step above built is gone. Populating it there and looping here silently iterated
@@ -577,9 +592,10 @@ jobs:
           [ "${#files[@]}" -gt 0 ] || { echo "FATAL: no artifacts to publish"; exit 1; }
           # Count the wheels PER INTERPRETER, not in total. `>= 2 wheels` was the first version of
           # this check and it accepted two cp311 wheels, a stray cp310, or an aarch64 build --
-          # "two of something" is not the promised set. CIBW_BUILD is exactly `cp311-* cp312-*` on
-          # x86_64, so the promised set is exactly one of each. (codex round 3.)
-          cp311=0 cp312=0 sdists=0
+          # "two of something" is not the promised set. CIBW_BUILD is exactly
+          # `cp311-* cp312-* cp313-*` on x86_64, so the promised set is exactly one of each.
+          # (codex round 3; cp313 added by #305.)
+          cp311=0 cp312=0 cp313=0 sdists=0
           for f in "${files[@]}"; do
             b="$(basename "$f")"
             case "$b" in
@@ -588,6 +604,8 @@ jobs:
                 echo "ok   $b"; cp311=$((cp311 + 1)) ;;
               cellstream-"$expected"-cp312-cp312-*manylinux*x86_64.whl)
                 echo "ok   $b"; cp312=$((cp312 + 1)) ;;
+              cellstream-"$expected"-cp313-cp313-*manylinux*x86_64.whl)
+                echo "ok   $b"; cp313=$((cp313 + 1)) ;;
               *) echo "FATAL: $b is not one of this release's promised artifacts"; exit 1 ;;
             esac
           done
@@ -597,6 +615,7 @@ jobs:
           # rejects a bare `linux_x86_64` (unrepaired), a musllinux wheel and any non-x86_64 arch.
           [ "$cp311" -eq 1 ] || { echo "FATAL: expected exactly 1 cp311 wheel, got $cp311"; exit 1; }
           [ "$cp312" -eq 1 ] || { echo "FATAL: expected exactly 1 cp312 wheel, got $cp312"; exit 1; }
+          [ "$cp313" -eq 1 ] || { echo "FATAL: expected exactly 1 cp313 wheel, got $cp313"; exit 1; }
           [ "$sdists" -eq 1 ] || { echo "FATAL: expected exactly 1 sdist, got $sdists"; exit 1; }
           # Everything above ties the tag to the BYTES. Nothing tied it to what those bytes SAY:
           # setuptools_scm derives the version from the tag, so a mistyped `v0.9.3` builds, passes
@@ -654,7 +673,7 @@ jobs:
             exit 1
           }
           echo "ok   the shipped CHANGELOG's newest entry is [$top]"
-          echo "validated: cp311 + cp312 wheels + 1 sdist + CHANGELOG, all at $expected"
+          echo "validated: cp311 + cp312 + cp313 wheels + 1 sdist + CHANGELOG, all at $expected"
 
   publish-pypi:
     name: publish to PyPI

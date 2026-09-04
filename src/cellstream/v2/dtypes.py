@@ -2,15 +2,25 @@
 
 Every codepath that picks indices/indptr dtypes — full read, contiguous
 subset, non-contiguous subset, kernel templating, CPU indptr prefix sum,
-torch hand-off — calls _index_dtypes_for and uses its return verbatim.
-This guarantees the PyTorch matching-dtype invariant holds everywhere.
+torch hand-off — takes its DEFAULT from _index_dtypes_for, which is what
+guarantees the PyTorch matching-dtype invariant. Two callers then treat that
+default differently. ``v2.materialize.resolve_plan`` may OVERRIDE it (an explicit
+``index_dtype``, or the uint32 narrow-read default above 65536 vars) and
+re-checks the torch matching rule itself when it does. ``read._cupy_csr_to_torch``
+re-applies it UNCONDITIONALLY on the DLPack hand-off, so on both live CSR
+``to_torch`` paths an explicit ``index_dtype`` is not propagated and does not
+CONTROL the tensor's index dtype -- it still matches whenever the request happens
+to equal this module's answer. A dense ``to_torch`` bypasses that helper and has
+no index/indptr dtype at all.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-_INT32_MAX = 2**31
+# EXCLUSIVE ceiling: the smallest ``total_nnz`` that no longer fits int32, whose max
+# is ``2**31 - 1``. Always compared with ``<`` / ``>=``, never ``<=``.
+_INT32_CEIL = 2**31
 
 
 def _index_dtypes_for(total_nnz: int, cast_back: bool, target: str) -> tuple[type, type]:
@@ -37,5 +47,5 @@ def _index_dtypes_for(total_nnz: int, cast_back: bool, target: str) -> tuple[typ
         )
     if not cast_back:
         return np.uint16, np.int64
-    matching = np.int32 if total_nnz < _INT32_MAX else np.int64
+    matching = np.int32 if total_nnz < _INT32_CEIL else np.int64
     return matching, matching

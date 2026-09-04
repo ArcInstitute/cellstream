@@ -4,6 +4,52 @@ All notable changes to **cellstream** are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-09-04
+
+### Added
+
+- **`AnnDataView` now satisfies the backed row-read contract it was written for** -- the narrow
+  one a training dataloader uses (`.X[rows]`, `obs`/`var`, evict by `file.close()`), not the whole
+  of backed AnnData. The view returned by `CellStore.to_anndata(backed=True)` is documented as a
+  drop-in for that path, but four things such a consumer reaches for were absent and a fifth
+  **raised**: `.X[slice]` went straight to `gather_rows`, which has no slice case and rejects one
+  with `TypeError`. Added: **slice indexing** on `.X` (bounds clipped, a zero step rejected, a
+  negative step preserved as descending row ids), **`var_names`**, **`isbacked`**, a **`file`**
+  handle whose `close()` calls the store's `close()` -- best effort: a `BufferError` from an
+  in-flight gather that still holds an exported view of the mmap, or an `OSError` for a file that
+  is already closed or already gone, is suppressed so an eviction path cannot take the consumer
+  down, and the store may then still be open -- and **`n_threads`**, plumbed through
+  `CellStore.to_anndata(backed=True, n_threads=1)` so a view's gathers can use the threaded Rust
+  decode path. Every addition is additive and defaulted: at `n_threads=1` the view calls
+  `gather_rows(rows)` exactly as before, so a duck-typed store written against the old
+  one-argument signature keeps working. Selectors other than slices are **delegated** to
+  `gather_rows` rather than re-derived, so `view.X[k]` and `store.gather_rows(k)` agree on 0-D
+  integer arrays, boolean masks and error types. Not added: `obs_names` (`.obs.index` serves it)
+  and two-axis `.X` indexing.
+
+### Changed
+
+- **`bitshuffle` is no longer a dependency; it is the optional `bitshuffle` extra.** Only the
+  legacy bitshuffle codec -- SHX2 shards written before v0.3.0, or a codec name that selects it
+  (`"bitshuffle"`, `"zstd-1-u16u16-bitshuffle"`, the two `blosc-zstd-1-u16u16*` presets) -- ever
+  used the package, and it was reached through a module-scope import that every `cellstream.*`
+  import path crosses, including the per-cell layout, which does not use it. The import is now
+  lazy, inside that codec's encode and decode, and a missing package raises an `ImportError` there
+  naming `pip install "cellstream[bitshuffle]"` -- the same shape as the `cell` extra's
+  `pyfastpfor`. **Action for legacy-codec users:** install the extra. A default install now fails
+  on the first non-empty legacy-codec stream it reads or writes, with that message, instead of
+  importing bitshuffle up front (an empty stream is a bare zstd frame and never needed the
+  package). Byte-filter and zstd-only shards, and everything under `layout="cell"`, are
+  unaffected. Importing `cellstream`, `cellstream.cell`, the v2 reader and the v2 writer leaves
+  `bitshuffle` out of `sys.modules` -- the test suite checks that in a fresh interpreter, and the
+  wheel build's test command asserts it for `import cellstream`. The `test` and `dev` extras pull
+  `bitshuffle` in through a self-reference, so the legacy-codec tests keep running everywhere.
+- **cp313 wheels.** `bitshuffle` publishes no cp313 wheel and was the single dependency keeping a
+  cp313 build from offering the all-wheel install the release policy requires; with it out of the
+  default set, a cp313 wheel ships alongside cp311 and cp312. On the supported target -- Linux
+  x86_64, manylinux_2_28 -- a 3.13 install of this release is therefore all wheels, like 3.11 and
+  3.12; 0.9.2 built two sdists there. Other platforms build from the sdist as before.
+
 ## [0.9.2] — 2026-08-24
 
 ### Fixed
@@ -279,6 +325,7 @@ placeholder was uploaded to PyPI in July 2026 to reserve the name and contains n
   (`mudata`) reads belong to that layout, not to the per-cell store.
 - **`.layers` and `.raw` are not stored** by the per-cell layout.
 
+[0.10.0]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.10.0
 [0.9.2]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.2
 [0.9.1]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.1
 [0.9.0]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.0

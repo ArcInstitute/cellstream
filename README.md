@@ -61,11 +61,11 @@ pip install cellstream
 uv pip install cellstream        # or, inside a uv project: uv add cellstream
 ```
 
-**Wheels cover Linux x86_64 with SSE4.1 and glibc ≥ 2.28, on CPython 3.11 and 3.12** (they are
-tagged `manylinux_2_28`). They carry the prebuilt Rust extension, so nothing compiles at install
-time and every dependency resolves to a wheel. This is the supported path and the one that needs
-no toolchain; 3.13 is supported too, from the sdist — see
-[Platform support](#platform-support-and-building-from-source). Check which one you are on:
+**Wheels cover Linux x86_64 with SSE4.1 and glibc ≥ 2.28, on CPython 3.11, 3.12 and 3.13** (they
+are tagged `manylinux_2_28`). They carry the prebuilt Rust extension, so nothing compiles at
+install time and every dependency resolves to a wheel. This is the supported path and the one that
+needs no toolchain — see [Platform support](#platform-support-and-building-from-source). Check
+which one you are on:
 
 ```bash
 cellstream runtime
@@ -86,7 +86,8 @@ pip install cellstream
 | extra | pulls in | when you need it |
 |---|---|---|
 | `cell` | `pyfastpfor` | Only for the **pure-Python** pfordelta codec, and only on x86_64. The Rust extension carries its own vendored FastPFor and never calls it, so a wheel install does not need this at all; reach for it if you run with `CELLSTREAM_DISABLE_RUST=1`. It is an extra rather than a dependency because `pyfastpfor` publishes no Linux wheel — installing it compiles C++. It is **not** an aarch64 workaround: `pyfastpfor` binds the same x86 FastPFor. |
-| `test` | `pytest`, `pytest-benchmark`, `ruff` | running the test suite. |
+| `bitshuffle` | `bitshuffle` | the **legacy bitshuffle codec** only — SHX2 shards written before v0.3.0, or a codec name that selects it. Nothing else imports it; without the extra, that one path raises an `ImportError` naming it on the first non-empty stream. On 3.13 it builds from source (no upstream cp313 wheel). |
+| `test` | `pytest`, `pytest-benchmark`, `ruff`, and the `bitshuffle` extra | running the test suite. Most of `tests/v2` writes legacy-codec archives and those tests are deliberately not skip-guarded, so here the extra is required, not optional. |
 | `dev` | the `test` set plus `mypy` | contributing. |
 | `mudata` | `mudata` | the [legacy shard layout](#legacy-the-shard-layout) only — multi-modal reads are a feature of that layout, not of the per-cell store. |
 | `gpu` | `cupy-cuda12x`, `nvidia-nvcomp-cu12` | likewise legacy-layout only: on-GPU decode of shard archives. |
@@ -101,9 +102,8 @@ reason. `pre-commit` is not an extra at all: `pip install pre-commit` separately
 ### Platform support, and building from source
 
 **Supported: Linux x86_64 with SSE4.1, glibc ≥ 2.28, on CPython 3.11, 3.12 or 3.13.** The
-**wheels** cover 3.11 and 3.12; on 3.13 `pip` falls back to the sdist and builds from source,
-which needs a Rust toolchain and a C++11 compiler. See **CPython 3.13** below. Other platforms
-build from source and are not claimed.
+**wheels** cover all three — cp313 since 0.10.0; see **CPython 3.13** below. Other platforms build
+from source and are not claimed.
 
 The SSE4.1 requirement is real but **not expressed by the wheel tag** — `manylinux_2_28_x86_64` is
 a glibc statement. The vendored FastPFor is compiled with `-msse4.1` and the shim asks for
@@ -130,12 +130,15 @@ intermittent per-cell write failures that were read as a 3.13 defect. They were 
 3.13** and never hit a local disk at all; see the CHANGELOG. **0.9.2 lifts the exclusion and fixes
 the underlying bug.** Two things to know:
 
-- **A 3.13 install builds two sdists, not one.** Neither this package nor `bitshuffle` publishes a
-  cp313 wheel, so `pip install cellstream` on 3.13 compiles both, which needs a Rust toolchain and
-  a C++11 compiler. That is a build cost, not a failure: CI runs 3.11, 3.12 and 3.13, and the
-  classifiers claim all three.
-- **No earlier release is a supported option there.** 0.9.1 remains uninstallable on 3.13: it
-  carries the cap, which is refused before any sdist is considered. 0.9.0 and the 0.0.1 name
+- **0.10.0 ships a cp313 wheel; 0.9.2 did not.** On 0.9.2 a 3.13 install built two sdists --
+  this package's and `bitshuffle`'s, which publishes no cp313 wheel -- needing a Rust toolchain and
+  a C++11 compiler. `bitshuffle` is no longer a dependency: only the legacy bitshuffle codec (SHX2
+  shards written before v0.3.0) needs it, it is imported only there, and it is now the optional
+  `bitshuffle` extra. On the supported Linux x86_64 target a default 3.13 install is therefore
+  all wheels, like 3.11 and 3.12 (other platforms build from the sdist as before). CI runs all
+  three, and the classifiers claim all three.
+- **No release before 0.9.2 is a supported option there.** 0.9.1 remains uninstallable on 3.13:
+  it carries the cap, which is refused before any sdist is considered. 0.9.0 and the 0.0.1 name
   placeholder remain yanked — 0.9.0 because every *functional* release before the fix carries that
   bug on a distributed filesystem whatever the Python version, 0.0.1 because it is a name
   placeholder with no working code. A yank is a soft signal rather than a deletion, so an *exact*
@@ -180,7 +183,10 @@ pytest tests/
 ```
 
 Core dependencies: `anndata`, `h5py`, `hdf5plugin`, `numpy`, `scipy`, `pandas`, `pyarrow`,
-`bitshuffle`, `zstandard`.
+`zstandard`. Reading or writing the **legacy bitshuffle codec** (SHX2 shards from before v0.3.0, or
+a codec name that selects it) additionally needs `pip install "cellstream[bitshuffle]"`; without it
+that one path raises an `ImportError` naming the extra on the first non-empty stream, and nothing
+else is affected. On 3.13 that extra builds `bitshuffle` from source (no upstream cp313 wheel).
 
 ### Checking the runtime from Python
 

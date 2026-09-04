@@ -37,9 +37,10 @@ def matrix_dir(key: str) -> str:
     """Filesystem-safe family directory for a matrix key (write-time only;
     readers use the manifest's stored paths).
 
-    ``x``/``raw`` unchanged (preserves Plan-1 byte-identity); ``layer:<n>``
-    (primary) -> ``layer_<safe n>``; ``modality:<m>`` -> ``modality_<safe m>``;
-    ``modality:<m>:layer:<n>`` -> ``modality_<safe m>__layer_<safe n>``.
+    ``x``/``raw`` unchanged (which preserves their existing byte layout);
+    ``layer:<n>`` (primary) -> ``layer_<safe n>``; ``modality:<m>`` ->
+    ``modality_<safe m>``; ``modality:<m>:layer:<n>`` ->
+    ``modality_<safe m>__layer_<safe n>``.
     Every char outside ``[0-9A-Za-z._-]`` becomes ``_``.
     """
 

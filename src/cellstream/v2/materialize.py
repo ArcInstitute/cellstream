@@ -1,9 +1,13 @@
 """Single source of truth for reader materialization: the (container, data dtype,
 index dtype) matrix + fail-loud lossy policy.
 
-resolve_plan() runs once in the parent (resolves + validates dtypes; lossy
-enforcement is deferred to cast_data()). cast_data() runs in each decode worker
-(the cast/scatter seam a future Rust pass will own)."""
+resolve_plan() resolves and validates dtypes before decode, and is a pure
+function of its inputs -- the layered GPU entry points resolve once for sizing
+and the reader they select resolves again. VALUE-level lossy enforcement is
+engine-specific rather than deferred to one place: on a pure-Python read it is
+cast_data()/cast_data_into(), run in each decode worker; for the (container,
+data_dtype, index_dtype) combos ``_rust_dispatch.use_rust_for_read`` covers, the
+Rust core owns that seam and cast_data() is not reached."""
 
 from __future__ import annotations
 
@@ -12,9 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from cellstream.narrow import lossless_cast
-from cellstream.v2.dtypes import _index_dtypes_for
-
-_INT32_MAX = 2**31  # used by resolve_plan's indptr/torch sizing (wired in Task 2)
+from cellstream.v2.dtypes import _INT32_CEIL, _index_dtypes_for
 
 # dtypes we accept as an explicit data_dtype request.
 _ALLOWED_DATA_KINDS = frozenset({"f", "i", "u"})  # float, signed int, unsigned int
@@ -40,10 +42,11 @@ def _validate_numeric_dtype(dt: np.dtype, *, where: str) -> None:
 def resolve_plan(
     manifest: dict, *, container, data_dtype, index_dtype, allow_lossy, cast_back, target
 ):
-    """Resolve the four kwargs + manifest on-disk dtypes into a MaterializePlan.
+    """Resolve the requested materialization settings + manifest metadata into a
+    MaterializePlan.
 
-    target in {"cpu", "cupy", "torch"}. The full index/indptr + torch logic is
-    completed in Task 2; this task wires container + data_dtype + the dataclass.
+    target in {"cpu", "cupy", "torch"}. Resolves the container, the data dtype,
+    the index/indptr dtypes and the torch sizing into one frozen plan.
     """
     if container not in ("csr", "dense"):
         raise ValueError(f"container must be 'csr' or 'dense'; got {container!r}")
@@ -96,7 +99,7 @@ def resolve_plan(
             raise ValueError(
                 f"target='torch' requires index_dtype int32 or int64; got {resolved_index}."
             )
-        if resolved_index == np.dtype(np.int32) and total_nnz >= _INT32_MAX:
+        if resolved_index == np.dtype(np.int32) and total_nnz >= _INT32_CEIL:
             raise ValueError(
                 f"target='torch' index_dtype int32 cannot hold total_nnz={total_nnz} "
                 f"(>= 2**31); use index_dtype='int64'."

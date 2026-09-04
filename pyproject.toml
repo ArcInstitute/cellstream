@@ -11,9 +11,11 @@ readme = "README.md"
 # The `<3.13` cap 0.9.1 shipped is LIFTED: it rested on intermittent per-cell write failures read
 # as a CPython 3.13 defect, and they were not one -- a path stat() on WekaFS can report a
 # stale-SHORT st_size, which hit Python 3.11 HARDER than 3.13 and never hit local ext4 at all
-# (#305). 3.13 has no `bitshuffle` wheel, so an install there builds that sdist; that is a build
-# cost, not a failure. CI runs 3.11, 3.12 and 3.13; the WHEELS are cp311/cp312 only (see
-# release.yml), which is a distribution fact rather than a language-support one.
+# (fixed in PR #319). CI runs 3.11, 3.12 and 3.13, and the WHEELS cover cp311/cp312/cp313 (see
+# release.yml).
+# The cp313 wheel became possible when `bitshuffle` -- which publishes no cp313 wheel -- left the
+# default dependencies for the `bitshuffle` extra below; nothing on the default install path
+# needs it any more.
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -41,7 +43,6 @@ dependencies = [
     "scipy>=1.11",
     "pandas>=2.0",
     "pyarrow>=14",
-    "bitshuffle>=0.5,<1.0",
     "zstandard>=0.22",
 ]
 
@@ -56,8 +57,13 @@ Changelog = "https://github.com/ArcInstitute/cellstream/blob/main/CHANGELOG.md"
 cellstream = "cellstream.cli:main"
 
 [project.optional-dependencies]
-test = ["pytest>=7", "pytest-benchmark", "ruff>=0.5"]
-dev  = ["pytest>=7", "pytest-benchmark", "ruff>=0.5", "mypy>=1.10"]
+# `test` and `dev` pull the `bitshuffle` extra through a self-reference rather than a second
+# copy of its pin, so the two cannot drift. The suite REQUIRES it: most of tests/v2 writes
+# legacy-codec archives, and those tests are deliberately not skip-guarded -- a venv without
+# the extra fails them loudly rather than reporting a green run that exercised nothing
+# (the same hazard the `cell` extra already poses for tests/cell).
+test = ["pytest>=7", "pytest-benchmark", "ruff>=0.5", "cellstream[bitshuffle]"]
+dev  = ["pytest>=7", "pytest-benchmark", "ruff>=0.5", "mypy>=1.10", "cellstream[bitshuffle]"]
 gpu = [
     "cupy-cuda12x>=13",
     "nvidia-nvcomp-cu12>=4.0,<5.0",
@@ -74,6 +80,14 @@ mudata = ["mudata>=0.2"]
 # The zstd pure-Python path needs nothing extra -- `_import_pyfastpfor` is called only from the
 # pfordelta encoder/decoder. (codex round 3.)
 cell = ["pyfastpfor>=1.4"]
+# The LEGACY bitshuffle codec -- SHX2 shards written before v0.3.0, or a codec name that selects
+# it (`v2/writer._V2_BITSHUFFLE_CODECS`). It was a default dependency until #305, and the only
+# DEFAULT dependency that publishes no cp313 wheel; nothing on the default path --
+# the byte-filter codec, zstd-only, the whole per-cell layout -- uses it. `v2/codec.py` imports
+# it lazily and raises an actionable ImportError naming this extra when it is missing. On 3.13
+# this extra builds bitshuffle from its sdist (a C compiler), exactly the cost the wheel policy
+# keeps off the default install.
+bitshuffle = ["bitshuffle>=0.5,<1.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

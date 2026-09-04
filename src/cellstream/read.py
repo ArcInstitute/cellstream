@@ -108,7 +108,7 @@ class GroupShard:
         # Set by iter_group_shards(prefetch>=1) to a prefetch._DecodedShard carrier
         # (raw matrix + deferred AnnData); None in lazy mode (prefetch=0).
         self._decoded = _decoded
-        # Family selector (Task 8); "x" (default) is the primary matrix. Carried
+        # Family selector; "x" (default) is the primary matrix. Carried
         # so the shared-partition streaming API (iter_group_shards(matrix=...))
         # can read one family per shard while shard i stays the same cells
         # across families.
@@ -227,10 +227,12 @@ class ShardedArchive:
     Parses manifest.json on construction; schema versions 2/3/4 are handled.
     The v1 h5ad-shard reader was removed in #154, so there is no longer a
     ``schema_version == 1`` branch. CPU materializations default to
-    ``output_backing="heap"`` and return ordinary heap arrays; pass
-    ``output_backing="shm"`` to keep a SharedMemory bundle attached to the
-    returned AnnData (released on AnnData GC). The pure-Python fallback uses
-    shared memory internally regardless.
+    ``output_backing="heap"``; pass ``output_backing="shm"`` to keep
+    shared-memory backing attached to the returned AnnData.
+    ``close_shared_memory()`` releases every attached bundle immediately;
+    AnnData GC instead unlinks their ``/dev/shm`` names, and any segment an
+    array still references stays mapped. What each value actually yields depends
+    on the decode engine and the archive layout — see ``to_anndata``'s Notes.
 
     """
 
@@ -289,8 +291,8 @@ class ShardedArchive:
         return [(k, v["role"]) for k, v in self._matrices.items()]
 
     def layer(self, name: str) -> ShardedArchiveView:
-        """Scoped view whose X is layer ``name`` (parallels the Plan-2 .modality()).
-        Uses the View ``matrix=`` support added in Task 8."""
+        """Scoped view whose X is layer ``name`` (parallels ``.modality()``).
+        Built on the View ``matrix=`` selector."""
         if self._matrices is None:
             raise ValueError("layer() is only valid on a multi-matrix (v4) archive.")
         if f"layer:{name}" not in self._matrices:
@@ -397,9 +399,12 @@ class ShardedArchive:
 
         The materialization knobs (``container``/``data_dtype``/``index_dtype``/
         ``allow_lossy``/``cast_back``) forward to ``resolve_plan`` exactly as the
-        single-matrix path does. ``output_backing`` selects heap vs a /dev/shm
-        bundle (threaded to ``read_v2_to_host``); on ``"shm"`` the returned X is a
-        shm-backed view and ``bundle`` is a real bundle (both engines)."""
+        single-matrix path does. ``output_backing`` is threaded to
+        ``read_v2_to_host``: on ``"shm"`` the returned X is a shm-backed view and
+        ``bundle`` is a real bundle (both engines); on ``"heap"`` only the Rust
+        engine returns owned arrays with ``bundle`` None -- the pure-Python
+        fallback still returns a view plus a real bundle, and the CALLER copies
+        out and releases it."""
         from cellstream.v2.materialize import resolve_plan
 
         sub = self._matrix_submanifest(key)
@@ -494,21 +499,40 @@ class ShardedArchive:
             int32/int64 indices; ``False`` → native on-disk dtypes. An explicit
             ``data_dtype``/``index_dtype`` overrides the corresponding default.
         output_backing : {"heap", "shm"}, default "heap"
-            Where the decoded X is allocated on the Rust read path. ``"heap"``
-            (default) uses plain numpy arrays (no ``/dev/shm``). ``"shm"`` uses a
-            ``/dev/shm``-backed bundle for cross-process / GPU-staging handoff.
-            ``"pinned"`` is reserved (GPU H2D, #40). Ignored on the pure-Python
-            fallback (which always uses ``/dev/shm``). Multi-matrix (v4) archives
-            only support ``"heap"`` for now (Plan 2 adds shm-backed multi reads).
+            Requested backing for the decoded matrix buffers. ``"heap"``
+            (default) asks for owned heap buffers (no ``/dev/shm``); ``"shm"``
+            asks for ``/dev/shm``-backed buffers pinned to the returned AnnData,
+            for cross-process / GPU-staging handoff. Both are supported on
+            single-matrix (v2/v3) and multi-matrix (v4) archives alike.
+            ``"pinned"`` is reserved (GPU H2D, #40) and raises
+            ``NotImplementedError``; any other value raises ``ValueError``.
+            What you get back also depends on the decode engine — see Notes.
 
         Notes
         -----
-        On a multi-matrix (v4) archive, the
-        per-family materialization knobs (``container``/``data_dtype``/
-        ``index_dtype``/``allow_lossy``/``cast_back``) ARE honored on the heap
-        path — each primary-group family is read with the same plan. Only a
-        non-``"heap"`` ``output_backing`` raises ``NotImplementedError`` (shm-backed
-        multi-matrix reads are Plan 2 chunk D).
+        ``output_backing`` is a request; the decode ENGINE and the archive
+        LAYOUT together decide how literally it is met. The Rust engine honors
+        ``"heap"`` exactly on either layout, decoding straight into owned
+        buffers. The pure-Python fallback always decodes into ``/dev/shm``: on a
+        single-matrix (v2/v3) archive ``"heap"`` still comes back bundle-backed,
+        while the v4 rebuild copies each decoded primary-group family to owned
+        heap and releases its bundle. This is the same for ``container="csr"``
+        and ``container="dense"``.
+
+        A bundle-backed single-matrix result carries one bundle; a bundle-backed
+        v4 result carries one per decoded primary-group family (``modality:*``
+        families are not read here). ``out.close_shared_memory()`` releases all
+        of them immediately. Letting the AnnData be garbage-collected instead
+        unlinks every ``/dev/shm`` name, but a segment that an array still
+        references stays mapped until that reference is dropped (#274).
+
+        On a multi-matrix (v4) archive the per-family materialization knobs
+        (``container``/``data_dtype``/``index_dtype``/``allow_lossy``/
+        ``cast_back``) ARE honored under either ``output_backing`` — each
+        primary-group family resolves its own plan from the same requested
+        values and its own submanifest (that family's on-disk and
+        minimum-lossless data dtypes, ``n_vars`` and ``total_nnz``), rather than
+        sharing one plan.
         """
         if self._matrices is None:
             if layer is not None:
@@ -533,9 +557,9 @@ class ShardedArchive:
 
         # output_backing validation is delegated to read_v2_to_host (accepts
         # "heap"/"shm"; "pinned" -> NotImplementedError). The shm-backed v4 rebuild
-        # (Plan 2 chunk D) keeps each family's decode in its /dev/shm bundle and
-        # pins them all to the returned AnnData (two-level pin via
-        # shm.attach_buffer_cleanup_multi) instead of copying every family to heap.
+        # keeps each family's decode in its /dev/shm bundle and pins them all to
+        # the returned AnnData (two-level pin via shm.attach_buffer_cleanup_multi)
+        # instead of copying every family to heap.
         shm_backed = output_backing != "heap"
         if layer is not None and f"layer:{layer}" not in self._matrices:
             raise KeyError(
@@ -721,9 +745,9 @@ class ShardedArchive:
         ``allow_lossy``/``cast_back``) mirror ``to_anndata()`` and apply to EVERY
         modality (one value for all). Default is float32 CSR, unchanged.
         ``output_backing="shm"`` (default ``"heap"``) keeps every modality's
-        families in /dev/shm bundles pinned to their AnnData; ``mdata.
-        close_shared_memory()`` then fans out to all modalities. A lossy request
-        without ``allow_lossy=True`` raises
+        families in /dev/shm bundles pinned to their AnnData;
+        ``mdata.close_shared_memory()`` then fans out to all modalities. A lossy
+        request without ``allow_lossy=True`` raises
         :class:`~cellstream.errors.LossyCastError`."""
         from cellstream import matrices as _mx
         from cellstream import shm as _shm
@@ -1194,7 +1218,8 @@ class ShardedArchive:
         )
         # Only add matrix to decode_kwargs when non-default, so an existing
         # single-matrix caller (matrix="x", the default) threads byte-for-byte
-        # the same decode_kwargs dict through iter_prefetched as before Task 8.
+        # the same decode_kwargs dict through iter_prefetched as it did before
+        # the family selector existed.
         if matrix != "x":
             decode_kwargs["matrix"] = matrix
         for plan, decoded in iter_prefetched(
@@ -1334,7 +1359,7 @@ class ShardedArchive:
         bool mask, or int array selecting the rows of obs / obsm that match X. Must
         be the SAME selector used to fetch X so obs and X stay aligned.
 
-        var_override: None uses the header's var (unchanged pre-Task-8 behavior);
+        var_override: None uses the header's var (the single-matrix behavior);
         otherwise (a family read on a multi-matrix archive whose var differs from
         the primary matrix's) this var DataFrame is used in its place.
         """
@@ -1371,7 +1396,7 @@ class ShardedArchiveView:
     def __init__(self, parent, key, *, matrix="x"):
         self.parent = parent
         self.key = key
-        # Family selector (Task 8): the default family this view reads when
+        # Family selector: the default family this view reads when
         # .x()/.to_anndata() are called without an explicit matrix=/layer=.
         # "x" (the primary matrix) preserves single-matrix (v2/v3) behavior.
         self.matrix = matrix
@@ -1433,7 +1458,7 @@ class ShardedArchiveView:
     ):
         """Read this view into an AnnData.
 
-        ``matrix``/``layer`` (Task 8) select a single family of a multi-matrix
+        ``matrix``/``layer`` select a single family of a multi-matrix
         (v4) archive — at most one of them may be set; ``layer=<n>`` is sugar
         for ``matrix=f"layer:{n}"``. Neither is v1-supported. ``None``/``None``
         falls back to this view's own default family (``self.matrix``, "x" for
@@ -1487,13 +1512,13 @@ class ShardedArchiveView:
         into host buffers, assemble the X matrix. Cleans up the shm bundle and
         re-raises on any failure before returning.
 
-        ``matrix`` (Task 8) selects a family on a multi-matrix (v4) archive: the
+        ``matrix`` selects a family on a multi-matrix (v4) archive: the
         per-family submanifest (``_matrix_submanifest``) + shard locator
         (``_matrix_shard_locator``) stand in for the parent's manifest / packed
         locator, and that family's own ``n_vars`` is used to assemble X. On a
-        single-matrix (v2/v3) archive (``self.parent._matrices is None``) this
-        is the unchanged pre-Task-8 path: the parent's manifest + source kwargs +
-        ``n_vars``, regardless of what ``matrix`` is passed.
+        single-matrix (v2/v3) archive (``self.parent._matrices is None``) the
+        parent's own manifest + source kwargs + ``n_vars`` are used instead,
+        regardless of what ``matrix`` is passed.
         """
         from cellstream.v2.materialize import resolve_plan
 
@@ -1545,8 +1570,10 @@ class ShardedArchiveView:
             # the Rust path honors output_backing="heap" literally and returns None for
             # both CSR and dense, while the pure-Python multiprocess path always returns
             # a real bundle for both (its workers must write into shared memory, and it
-            # skips the copy-out whenever _return_shm_bundle is set). That is what
-            # to_anndata's docstring means by "Ignored on the pure-Python fallback".
+            # skips the copy-out whenever _return_shm_bundle is set). On THIS
+            # single-family view path that bundle-backed result is what the caller
+            # gets -- unlike ShardedArchive.to_anndata's whole-archive v4 rebuild,
+            # this path does not copy it out.
             # Either way the caller is safe: bundle-backed CSR arrays each pin their own
             # segment (#274), and a bundle-backed dense array is re-wrapped by
             # _x_from_result via dense_array_for_bundle (#182).
@@ -1589,7 +1616,7 @@ class ShardedArchiveView:
         The shm bundle (if any) is pinned to the returned matrix so it stays valid
         after this view is dropped (mirrors ``attach_buffer_cleanup`` on X).
 
-        ``matrix``/``layer`` (Task 8) select a single family of a multi-matrix
+        ``matrix``/``layer`` select a single family of a multi-matrix
         (v4) archive — see ``to_anndata()`` for the shared semantics.
         """
         key = self._resolve_matrix(matrix, layer)

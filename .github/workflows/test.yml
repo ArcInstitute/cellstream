@@ -18,12 +18,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.13 joins the matrix with the #305 fix: `requires-python` now permits it, and
+        # 3.13 joins the matrix with the stale-stat() fix (PR #319): `requires-python` now permits it, and
         # tests/test_matrices.py's MatrixSpec.__eq__ regression is MEANINGLESS without it --
         # the defect it guards is 3.13-only dataclass codegen, so that test passes with the
         # fix deleted on 3.11/3.12. Matrix entries run in parallel, so this costs runner
         # minutes, not wall clock; the 3.13 job additionally builds `bitshuffle` from its
-        # sdist (no cp313 wheel exists). NOTE it is a NEW status-check name -- branch
+        # sdist (no cp313 wheel exists) -- pulled in by the `test` extra so the legacy-codec
+        # tests run on every arm; since #305 it is not a dependency of the package itself.
+        # NOTE it is a NEW status-check name -- branch
         # protection lists required checks by name and will not include it until updated.
         python: ["3.11", "3.12", "3.13"]
     steps:

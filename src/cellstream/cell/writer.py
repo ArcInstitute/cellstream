@@ -239,7 +239,7 @@ def _reorder_frames_python(staging_path, out_path, in_offsets, perm):
     # frames, a longer one (with repeated valid indices) silently duplicates them. Both would
     # otherwise return OK with no other signal, so this is checked explicitly rather than left
     # to the out-of-range guard below (which only catches invalid *values*, not a wrong *count*
-    # of otherwise-valid ones). (#219 Task 5 review finding 2.)
+    # of otherwise-valid ones). (#219.)
     if perm.size != n_src:
         raise ValueError(f"reorder_frames: perm length {perm.size} != {n_src} frames")
     if perm.size and (int(perm.min()) < 0 or int(perm.max()) >= n_src):
@@ -256,7 +256,7 @@ def _reorder_frames_python(staging_path, out_path, in_offsets, perm):
                     # Zero-length frame: skip before touching mm. When EVERY frame is
                     # zero-length the staging file is 0 bytes, so mm is None -- indexing it
                     # would raise TypeError even though there is nothing to copy. Mirrors
-                    # Rust's `if len == 0 { continue; }`. (#219 Task 5 review finding 1.)
+                    # Rust's `if len == 0 { continue; }`. (#219.)
                     continue
                 of.write(mm[start:end])
         finally:

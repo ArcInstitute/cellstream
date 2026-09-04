@@ -1,9 +1,23 @@
 """v2 CPU reader: parallel mmap + decode -> numpy CSR streams.
 
-Uses the v0.1 SharedMemory bundle pattern: parent pre-allocates one shm
-segment per stream sized for the full output. Workers attach by name and
-write directly into pre-sliced views -- no per-shard numpy arrays cross
-process boundaries.
+Two engines, with different concurrency AND different memory. The PURE-PYTHON
+engine uses the v0.1 SharedMemory bundle pattern: the parent ALWAYS allocates the
+output segments (three for CSR, one for dense) sized for the full output; a
+multi-shard read then spawns worker PROCESSES that attach by name and write into
+pre-sliced views, while a single-shard read (or ``n_workers<=1``) runs the same
+ATTACHING worker inline -- skipping the spawn, not the attach -- and an empty
+selection runs neither. No decoded output crosses a process boundary -- workers
+write into the parent's segments. What a spawned worker receives is a pickled
+ARGUMENT TUPLE (the shm names, running offsets, dtype names, flags, and the
+per-shard plan); on a non-contiguous subset that plan carries an int64 local-row
+array as long as that shard's selection, and an all-True mask makes it comparable
+to the indptr array ``_plan_shards`` deliberately keeps OUT of the plan for its
+size. Whether the CALLER then gets those shm buffers or heap copies is
+``_return_shm_bundle``'s choice, not the workers': the default path copies out
+and releases the bundle. The RUST engine is a single-process THREADED decode:
+``n_workers`` is a thread budget the Rust driver clamps to
+``max(1).min(n_shards)``, and it fills whichever buffers ``output_backing`` asked
+for -- with ``"heap"`` it never touches /dev/shm at all.
 
 Subset support:
 - Full archive (no kwargs).
@@ -38,12 +52,16 @@ from cellstream.v2.materialize import cast_data, resolve_plan
 # Gemini suggested instead using a Pool initializer defined in a "clean"
 # module that doesn't transitively import bitshuffle, so the worker bootstrap
 # wouldn't trigger bitshuffle's import-time OMP init before the initializer
-# runs. Empirically rejected: cellstream/__init__.py eagerly imports
-# cellstream.read -> cellstream.v2.reader_cpu -> bitshuffle, so ANY cellstream.*
-# module's import path drags bitshuffle in. A clean initializer would need to
-# live outside the cellstream package altogether — a larger restructure deferred
-# to a future PR. For now the parent-env approach + lock is the empirically-
-# validated fix.
+# runs. That was rejected at the time because cellstream/__init__.py eagerly
+# imported cellstream.read -> cellstream.v2.reader_cpu -> bitshuffle, so ANY
+# cellstream.* import path dragged bitshuffle in. Since #305 that premise is
+# gone: v2/codec.py imports bitshuffle lazily, inside the legacy codec's encode
+# and decode, so a worker's bootstrap imports no bitshuffle at all and an
+# initializer WOULD now run before its OpenMP pool exists. The parent-env
+# approach is kept anyway: it is correct (a spawn child copies the parent's
+# environment at spawn, before any initializer or task runs, and reads it
+# whenever the pool is first sized), it is the validated form, and changing the
+# mechanism is not what #305 was about.
 # Reuse the SAME lock instance the write path uses (ultrareview L10): read and
 # write both mutate the single global os.environ["OMP_NUM_THREADS"], so they must
 # serialize on one lock — two separate locks let a concurrent read + write clobber
@@ -133,13 +151,17 @@ def _dispatch_workers(fn, inputs, n_workers, omp_nthreads):
     shard / n_workers<=1). ``fn`` writes into the shm bundle by side effect; its
     return value is ignored.
 
-    Uses spawn (not fork): bitshuffle initialises OMP thread pools on import, and
-    forking after that deadlocks the child. OMP_NUM_THREADS is set in the *parent*
-    so spawn workers inherit it from the OS env on first import (a Pool
-    ``initializer`` is too late — pickling it re-imports reader_cpu -> bitshuffle
-    first, which inits OMP to os.cpu_count(); 16x192=3072 threads on a 64-CPU box
-    is a ~30x collapse). ProcessPoolExecutor spawns LAZILY, so OMP_NUM_THREADS must
-    stay set (and _OMP_ENV_LOCK held) across the whole submit + as_completed window.
+    Uses spawn (not fork): a parent that has imported bitshuffle (any non-empty
+    legacy-codec call, now that the import is lazy) holds an initialised OpenMP pool, and forking
+    after that deadlocks the child. OMP_NUM_THREADS is set in the *parent* so spawn
+    workers inherit it in their environment at spawn; bitshuffle reads it when the
+    legacy codec first imports it inside a task, and sizes its pool then. (Before
+    #305 that import happened during worker bootstrap -- unpickling the task
+    re-imported reader_cpu -> bitshuffle -- which is why a Pool ``initializer`` was
+    too late and OMP initialised to os.cpu_count(): 16x192=3072 threads on a 64-CPU
+    box, a ~30x collapse. The bootstrap import is gone; the parent-env form stays.)
+    ProcessPoolExecutor spawns LAZILY, so OMP_NUM_THREADS must stay set (and
+    _OMP_ENV_LOCK held) across the whole submit + as_completed window.
     Manual executor lifecycle (not ``with``) keeps fail-fast: a SIGKILLed/OOM worker
     surfaces as BrokenProcessPool promptly instead of hanging (#48/#49); on ANY
     error we shutdown(wait=False, cancel_futures=True) and re-raise so the caller
@@ -243,13 +265,16 @@ def read_v2_to_host(
         OpenMP thread count per spawn worker.  Passed to workers by
         setting ``OMP_NUM_THREADS`` in the *parent* process immediately
         before the Pool is created; spawn workers inherit the env var
-        from the OS and bitshuffle reads it on first import.
+        at spawn, and bitshuffle reads it when the legacy codec first
+        imports it inside a task (the import is lazy since #305).
 
-        Note: using a Pool ``initializer`` to set the env var is
-        insufficient — pickling the initializer causes the worker to
-        import ``reader_cpu.py`` (and hence ``bitshuffle``) before the
-        initializer can run, so bitshuffle initialises its OpenMP pool
-        to ``os.cpu_count()`` regardless.
+        Note: a Pool ``initializer`` used to be insufficient for this --
+        pickling it made the worker import ``reader_cpu.py`` (and hence
+        ``bitshuffle``) before the initializer could run, so the OpenMP
+        pool was sized to ``os.cpu_count()`` regardless. With the lazy
+        import that ordering problem no longer exists; the parent-env
+        form is kept as the validated mechanism, not because the
+        alternative is still broken.
 
         The default of 4 matches v0.1's ``blosc_nthreads`` default
         and keeps total thread count (n_workers × omp_nthreads) ≈ 64
@@ -329,11 +354,13 @@ def read_v2_to_host(
 
     # The Rust decode core (and use_rust_for_read) gate on the SHUFFLE marker each
     # shard self-describes (ShxHeader.shuffle). Source it from the actual per-shard
-    # header (recorded by _plan_shards above) — NOT the manifest codec — so a float
-    # archive's rawdata marker (BYTE_FILTER_RAWDATA_SHUFFLE_NAME) correctly routes to
-    # the Python decoder, while a pre-#142 shuffled-float archive (header marker still
-    # BYTE_FILTER_SHUFFLE_NAME) keeps the Rust path. The marker is uniform per archive,
-    # so the first affected shard is authoritative. (#142; Gemini PR #143 r1.)
+    # header (recorded by _plan_shards above) — NOT the manifest codec — so each shard
+    # is judged by what it actually contains. The Rust core covers BOTH byte-filter
+    # markers (shuffled, and the #142 rawdata variant since #144:
+    # _RUST_READ_SHUFFLE_MARKERS), decoding each self-describingly; the header marker
+    # is what rejects a genuinely uncovered one, which the manifest codec proxy cannot
+    # do. The marker is uniform per archive, so the first affected shard is
+    # authoritative. (#142; Gemini PR #143 r1.)
     # No affected shards (empty selection) -> nothing to decode; the manifest-codec
     # proxy is a harmless fallback.
     if per_shard_plan:
@@ -754,9 +781,10 @@ def _plan_shards(shard_locator, manifest, affected, rows, contiguous):
                 "full_rows": len(shard_indptr) - 1,
                 "full_nnz": int(shard_indptr[-1]),
                 # Authoritative self-describing codec marker for this shard. The Rust
-                # decode gate keys on this (NOT the manifest codec), so a float
-                # rawdata archive routes to the Python decoder while old shuffled
-                # archives stay on Rust. Uniform per archive. (#142)
+                # decode gate keys on this (NOT the manifest codec); it covers both
+                # the shuffled and the #142 rawdata variant, so the marker is what
+                # rejects an uncovered codec rather than what splits float from
+                # shuffled. Uniform per archive. (#142)
                 "shuffle": header.shuffle,
             }
         )

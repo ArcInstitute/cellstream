@@ -31,12 +31,13 @@ OMP_ENV_LOCK = threading.Lock()
 def omp_nthreads_in_env(n_threads: int | None):
     """Set OMP_NUM_THREADS in the parent env for the executor's lifetime, then restore.
 
-    bitshuffle reads OMP_NUM_THREADS at import time and sizes its OpenMP pool
-    then. Spawn workers re-import bitshuffle, so the value must be set in the
-    PARENT before any worker spawns (a Pool initializer runs too late — the
-    initializer pickle imports the worker module, which imports bitshuffle,
-    before the initializer body runs). Mirrors v2/reader_cpu.py's inline OMP
-    dance.
+    bitshuffle reads OMP_NUM_THREADS when it is imported and sizes its OpenMP pool
+    then. A spawn worker copies the parent's environment at spawn, so setting the
+    value in the PARENT for the executor's lifetime is what every worker sees --
+    whether bitshuffle is imported during its bootstrap (the case before #305, when
+    v2/codec.py imported it at module scope and a Pool initializer therefore ran too
+    late) or, as now, lazily on the first legacy-codec encode inside a task. Mirrors
+    v2/reader_cpu.py's inline OMP dance.
 
     Held across the whole executor lifetime because ProcessPoolExecutor spawns
     workers lazily (each submit() can trigger another spawn).

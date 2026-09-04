@@ -812,13 +812,26 @@ class CellStore:
         row_ids = _normalize_row_ids(row_ids, self.n_obs)
         return self._subset_adata(self.gather_rows(row_ids, n_threads=n_threads), row_ids)
 
-    def to_anndata(self, backed: bool = True):
+    def to_anndata(self, backed: bool = True, n_threads: int = 1):
+        """Lazy AnnData-like view over this store (see :class:`~cellstream.cell.view.AnnDataView`).
+
+        ``n_threads`` is forwarded to every :meth:`gather_rows` the view issues. The default of
+        1 keeps existing callers serial and is usually right under a multi-process DataLoader,
+        where parallelism is the worker count and threads on top would oversubscribe; raise it
+        for a single-process bulk read.
+
+        Two details of that forwarding, because neither is literal: the value is clamped to
+        ``max(1, int(n_threads))``, so 0 and negatives behave as 1 rather than being passed on;
+        and at an effective 1 the view calls ``gather_rows(rows)`` with **no** ``n_threads``
+        keyword at all, which is what keeps a duck-typed store written against the older
+        one-argument signature working.
+        """
         if not backed:
             raise NotImplementedError(
                 "CellStore.to_anndata(backed=False) is deferred; use cellstream.read_h5ad(path) "
                 "for a materialized AnnData, or backed=True for the lazy view."
             )
-        return AnnDataView(self)
+        return AnnDataView(self, n_threads=n_threads)
 
     @property
     def has_payload_checksum(self) -> bool:

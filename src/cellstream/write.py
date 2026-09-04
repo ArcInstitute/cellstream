@@ -155,13 +155,13 @@ def write_sharded(
         ``None``), keyed by name, each in the **same cells/obs order** as the
         primary ``adata``. Each becomes its own ``modality:<name>`` family
         with its own var, layers, and obsm/varm/uns, sharing the primary's
-        cell partition (Plan 2 multi-matrix). Passing a non-empty
-        ``modalities`` (or a ``.raw``/non-empty ``.layers`` on ``adata``)
-        routes the write to the multi-matrix (``schema_version=4``) packed
-        writer. A ``MuData`` passed as ``adata`` is also accepted — it is
-        converted to a primary + ``modalities`` pair via the optional
-        ``mudata`` adapter (``mudata_adapter.mudata_to_native``) rather than
-        being built by the caller here.
+        cell partition. Passing a non-empty ``modalities`` (or a
+        ``.raw``/non-empty ``.layers`` on ``adata``) routes the write to the
+        multi-matrix (``schema_version=4``) packed writer. A ``MuData`` passed as
+        ``adata`` is also accepted — it is converted to a primary +
+        ``modalities`` pair via the optional ``mudata`` adapter
+        (``mudata_adapter.mudata_to_native``) rather than being built by the
+        caller here.
     primary_modality
         The primary modality's name as a ``str | None`` (default ``None``),
         stored in the manifest so ``ShardedArchive.to_mudata()`` can name it

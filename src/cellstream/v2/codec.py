@@ -1,13 +1,27 @@
-"""Pure-function CPU codec for SHX2.
+"""Pure-function CPU codecs for SHX2 streams.
 
-bitshuffle + zstd-1 on write; zstd decompress + bitshuffle inverse on
-read. The same compressed bytes are decoded on GPU by v2.reader_gpu
-(via nvCOMP for zstd + our CUDA kernel for the inverse).
+Three codecs live here, all self-describing through the ``ShxHeader.shuffle`` marker:
+
+* the **byte-filter** codec (``byte_filter_encode`` / ``byte_filter_decode``) -- the write
+  default since v0.3.0, and what ``cellstream.cell`` reaches for;
+* **zstd-only** (``zstd_only_encode`` / ``zstd_only_decode``) -- the float-data arm;
+* the **legacy bitshuffle** codec (``bitshuffle_zstd_encode`` / ``bitshuffle_zstd_decode``) --
+  bitshuffle + zstd-1, the original SHX2 codec, still readable and still selectable by name.
+
+Only the legacy codec needs the ``bitshuffle`` package, and it is imported LAZILY, inside those
+two functions, through :func:`_import_bitshuffle` (#305). Every ``cellstream.*`` import path
+reaches this module (``cellstream.read`` -> ``v2.reader_cpu`` -> here; ``cellstream.cell.codec``
+imports the byte-filter and zstd-only primitives from it), so a module-scope import here made
+``bitshuffle`` a hard dependency of the whole package -- including the per-cell layout, which
+never uses it -- and blocked a cp313 wheel, because bitshuffle publishes none. It is now the
+optional ``bitshuffle`` extra. The GPU reader never needs it either, for a different reason: it
+does not decode the legacy codec at all -- ``v2.reader_gpu`` raises ``NotImplementedError`` for a
+bitshuffle archive before importing cupy (its bit-plane inverse kernel was removed in #150, and
+the production device path is the byte-filter codec in ``codec_gpu``).
 """
 
 from __future__ import annotations
 
-import bitshuffle
 import numpy as np
 import zstandard as zstd
 
@@ -21,18 +35,59 @@ _CONTENTSIZE_UNKNOWN = getattr(zstd, "CONTENTSIZE_UNKNOWN", 2**64 - 1)
 _CONTENTSIZE_ERROR = getattr(zstd, "CONTENTSIZE_ERROR", 2**64 - 2)
 
 
+def _import_bitshuffle():
+    """Import bitshuffle, or raise with the install instruction.
+
+    THE one place that message lives, mirroring ``cell.codec._import_pyfastpfor``. Called from
+    the legacy codec's encode and decode only, so a default install -- which no longer carries
+    the package -- fails exactly where the legacy codec is actually needed and nowhere else,
+    with an actionable message instead of a bare ``ModuleNotFoundError`` from inside a chunk
+    loop or a spawn worker. ``ImportError`` is kept as the type so an existing
+    ``except ImportError`` around an optional-feature probe keeps working. The import is
+    repeated per call on purpose: after the first one it is a ``sys.modules`` lookup, and
+    caching the module in a global would defeat the ``sys.modules`` poisoning the tests use
+    to prove the package is optional.
+
+    Only an ABSENT package gets the install message: ``ModuleNotFoundError`` whose ``name`` is
+    the package itself. Anything else an import can raise -- an extension that fails to load,
+    a module missing INSIDE an installed bitshuffle -- is a broken install, not a missing one,
+    and "install the extra" would be wrong advice; those propagate unchanged. (codex.)
+    """
+    try:
+        import bitshuffle
+    except ModuleNotFoundError as e:
+        if e.name != "bitshuffle":  # a broken install, not an absent one
+            raise
+        raise ImportError(
+            "The legacy bitshuffle codec -- SHX2 shards written before v0.3.0, or a codec name "
+            "that selects it -- requires the 'bitshuffle' package, which is no longer a default "
+            "dependency (#305). Install the extra: pip install 'cellstream[bitshuffle]'. "
+            "Note bitshuffle publishes no cp313 wheel, so on Python 3.13 that install builds "
+            "from source and needs a C compiler."
+        ) from e
+    return bitshuffle
+
+
 def bitshuffle_zstd_encode(arr: np.ndarray, *, level: int = 1) -> bytes:
-    """Bitshuffle preprocess then zstd-compress. Returns the compressed bytes."""
+    """Bitshuffle preprocess then zstd-compress. Returns the compressed bytes.
+
+    Legacy codec: needs the ``bitshuffle`` extra (see :func:`_import_bitshuffle`)."""
     if arr.size == 0:
         return zstd.ZstdCompressor(level=level).compress(b"")
+    bitshuffle = _import_bitshuffle()
     shuf = bitshuffle.bitshuffle(np.ascontiguousarray(arr))
     return zstd.ZstdCompressor(level=level).compress(shuf.tobytes())
 
 
 def bitshuffle_zstd_decode(compressed: bytes, *, dtype: type, n_elements: int) -> np.ndarray:
-    """zstd-decompress then bitshuffle inverse to recover ``arr``."""
+    """zstd-decompress then bitshuffle inverse to recover ``arr``.
+
+    Legacy codec: needs the ``bitshuffle`` extra (see :func:`_import_bitshuffle`). The import
+    comes FIRST, before the zstd step, so a missing package is reported as such rather than
+    after a decompression that was going to be thrown away."""
     if n_elements == 0:
         return np.array([], dtype=dtype)
+    bitshuffle = _import_bitshuffle()
     raw = _decompress_checked(
         compressed,
         expected=np.dtype(dtype).itemsize * n_elements,
