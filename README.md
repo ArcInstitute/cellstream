@@ -395,6 +395,7 @@ path.
 | `.group_labels()` / `.group_spans()` / `.reference_row_count()` | — | Group layout, readable before any read. `.is_grouped` is a **property**. |
 | `.to_anndata(backed=True)` | `AnnDataView` | Lazy, AnnData-*like* view (`cellstream.cell.AnnDataView`, not an `anndata.AnnData`): `X` decodes on indexing. `backed=False` raises — use `read_h5ad(path)` for a materialized object. |
 | `.obs` / `.var` / `.uns` / `.obsm` / `.varm` / `.obsp` / `.varp` | — | Annotations, without decoding `X`. |
+| `.update_obs(new_obs)` / `.update_var(new_var)` | `None` | Replace `obs` / `var` in the archive, in place. The index must match — rows and features are not reordered — and on a grouped archive `obs` must keep the `group_by` column's labels, since `groups.json` is not rebuilt. Rewrites only the metadata, never `X`, and refreshes this store; any other handle opened before the edit must be reopened. |
 | `.shape` | — | `(n_obs, n_vars)`. (`.n_rows` is a `GroupSpan` property, not a store one.) |
 | `.has_payload_checksum` (**property**) / `.verify_payload()` | `bool` | See [Integrity](#integrity). |
 | `.close()` | `None` | Release the mmap and the file handle. |

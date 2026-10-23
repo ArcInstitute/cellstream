@@ -353,7 +353,13 @@ def test_integral_float_takes_pfordelta_with_no_warning(tmp_path):
     a.var_names = ["g0", "g1"]
     out = tmp_path / "int.shad"
     with warnings.catch_warnings():
-        warnings.simplefilter("error")  # ANY warning fails the test
+        warnings.simplefilter("error")  # ANY warning fails the test...
+        # ...except one raised inside a dependency: under pandas 3.1, anndata 0.13's own
+        # write_h5ad reads the deprecated 'future.infer_string' option and gets a Pandas4Warning.
+        # Not cellstream's, and not the codec-fallback warning this test is about.
+        warnings.filterwarnings(
+            "ignore", message=r"The 'future\.infer_string' option is deprecated"
+        )
         write_cell_archive(a, out, overwrite=True)
     s = open_cell(str(out))
     try:

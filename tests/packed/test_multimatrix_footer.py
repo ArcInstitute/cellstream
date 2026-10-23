@@ -154,31 +154,84 @@ def test_unpreservable_members_is_name_based_not_role_based():
     """
     from cellstream.packed.writer import _unpreservable_members
 
+    sre = 8192
+
+    def tail(name, role):  # a further member in the metadata region, past the boundary
+        return {"name": name, "role": role, "offset": 20480, "length": 100}
+
     shards_and_metadata = [
-        {"name": "x/shard_0000.shx", "role": "shard", "matrix": "x", "shard_idx": 0},
-        {"name": "header.h5ad", "role": "header"},
-        {"name": "obs.parquet", "role": "obs"},
-        {"name": "manifest.json", "role": "manifest"},
+        {
+            "name": "x/shard_0000.shx",
+            "role": "shard",
+            "matrix": "x",
+            "shard_idx": 0,
+            "offset": 4096,
+            "length": 100,
+        },
+        {"name": "header.h5ad", "role": "header", "offset": 8192, "length": 100},
+        {"name": "obs.parquet", "role": "obs", "offset": 12288, "length": 100},
+        {"name": "manifest.json", "role": "manifest", "offset": 16384, "length": 100},
     ]
     # Everything the rewrite re-emits -> nothing at risk (a v1/v2 archive must still update).
-    assert _unpreservable_members(shards_and_metadata) == []
+    assert _unpreservable_members(shards_and_metadata, sre) == []
     # groups.json is optional and also re-emitted.
-    assert (
-        _unpreservable_members(shards_and_metadata + [{"name": "groups.json", "role": "groups"}])
-        == []
-    )
+    assert _unpreservable_members(shards_and_metadata + [tail("groups.json", "groups")], sre) == []
 
     # v4 sidecars -> refused (the original #254 case).
-    assert _unpreservable_members(
-        shards_and_metadata + [{"name": "var/x.parquet", "role": "var"}]
-    ) == ["var/x.parquet"]
+    assert _unpreservable_members(shards_and_metadata + [tail("var/x.parquet", "var")], sre) == [
+        "var/x.parquet"
+    ]
 
     # ALLOWED role, unexpected name -> still refused. A role-only check would MISS this.
     assert _unpreservable_members(
-        shards_and_metadata + [{"name": "manifest2.json", "role": "manifest"}]
+        shards_and_metadata + [tail("manifest2.json", "manifest")], sre
     ) == ["manifest2.json"]
 
     # Unknown role entirely -> refused (fails closed on future member kinds).
     assert _unpreservable_members(
-        shards_and_metadata + [{"name": "future.bin", "role": "something-new"}]
+        shards_and_metadata + [tail("future.bin", "something-new")], sre
     ) == ["future.bin"]
+
+
+def test_unpreservable_members_keeps_what_lies_below_shard_region_end():
+    """#338: what survives the tail rewrite is decided by WHERE a member is stored.
+
+    The rewrite truncates at shard_region_end, so a member wholly below it keeps its bytes and
+    its footer entry whatever its role -- the cell layout's payload / offsets / indptr, which
+    the old role == "shard" rule refused. Past the boundary a member is deleted unless it is
+    re-emitted by name, whatever its role: a DATA role stored there is refused, which a rule
+    keyed on _IMMUTABLE_ROLES would miss.
+    """
+    from cellstream.packed.writer import _unpreservable_members
+
+    # docs/format.md section 2.3's worked footer.
+    sre = 16384
+    cell = [
+        {"name": "x_payload", "role": "payload", "offset": 4096, "length": 2536},
+        {"name": "x_offsets", "role": "offsets", "offset": 8192, "length": 328},
+        {"name": "x_indptr", "role": "indptr", "offset": 12288, "length": 328},
+        {"name": "header.h5ad", "role": "header", "offset": 16384, "length": 36120},
+        {"name": "obs.parquet", "role": "obs", "offset": 53248, "length": 2163},
+        {"name": "manifest.json", "role": "manifest", "offset": 57344, "length": 599},
+        {"name": "groups.json", "role": "groups", "offset": 61440, "length": 158},
+    ]
+    assert _unpreservable_members(cell, sre) == []
+    # An empty archive: x_payload is 0 bytes long and shares its offset with x_offsets.
+    empty = [
+        {"name": "x_payload", "role": "payload", "offset": 4096, "length": 0},
+        {"name": "x_offsets", "role": "offsets", "offset": 4096, "length": 8},
+        {"name": "x_indptr", "role": "indptr", "offset": 8192, "length": 8},
+        {"name": "header.h5ad", "role": "header", "offset": 12288, "length": 100},
+    ]
+    assert _unpreservable_members(empty, 12288) == []
+
+    # A data role stored past the boundary -> its bytes are truncated away -> refused.
+    past = {"name": "x_extra", "role": "payload", "offset": 65536, "length": 100}
+    assert _unpreservable_members(cell + [past], sre) == ["x_extra"]
+    # Straddling the boundary -> cut by the truncation -> refused.
+    cut = {"name": "x_cut", "role": "offsets", "offset": 14336, "length": 4096}
+    assert _unpreservable_members(cell + [cut], sre) == ["x_cut"]
+    # Below the boundary under a re-emitted name -> it would be emitted twice -> refused.
+    twice = [m for m in cell if m["name"] != "groups.json"]
+    twice.append({"name": "groups.json", "role": "groups", "offset": 14336, "length": 100})
+    assert _unpreservable_members(twice, sre) == ["groups.json"]

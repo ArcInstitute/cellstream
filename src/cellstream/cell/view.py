@@ -94,6 +94,30 @@ class _FileShim:
                 raise
 
 
+def _format_repr(kind, n_obs, n_vars, path, sections, x_line=None) -> str:
+    """anndata's backed ``__repr__`` layout, shared by :class:`CellStore` and :class:`AnnDataView`.
+
+    ``sections`` is an ordered iterable of ``(name, keys)``; an empty ``keys`` prints nothing,
+    as anndata skips an empty slot. Keys are rendered with anndata's own idiom,
+    ``str(list(keys))[1:-1]`` -- quoted and comma-separated, and it does not fail on a
+    non-string label the way ``", ".join`` does. ``x_line``, when given, becomes a trailing
+    ``X:`` line; anndata has no equivalent, so it is kept out of the header (#336).
+    """
+    n_obs = "?" if n_obs is None else n_obs
+    n_vars = "?" if n_vars is None else n_vars
+    head = f"{kind} with n_obs × n_vars = {n_obs} × {n_vars}"
+    if path is not None:
+        head += f" backed at {str(path)!r}"
+    lines = [head]
+    for name, keys in sections:
+        keys = list(keys)
+        if keys:
+            lines.append(f"    {name}: {str(keys)[1:-1]}")
+    if x_line is not None:
+        lines.append(f"    X: {x_line}")
+    return "\n".join(lines)
+
+
 class AnnDataView:
     def __init__(self, store, n_threads: int = 1):
         self._store = store
@@ -105,6 +129,20 @@ class AnnDataView:
         # `.file` is a persistent object, and an identity-sensitive caller should not see a new
         # one on every attribute access.
         self._file = _FileShim(store)
+
+    def __repr__(self):
+        # Not `repr(self._store)` with the class name swapped: the store is duck-typed (anything
+        # with `gather_rows`), and a foreign store's repr is neither in this layout nor known to
+        # be cheap. A CellStore hands over the metadata-only parts it prints itself; any other
+        # store shows what it exposes, and nothing is read from it (#336).
+        parts = getattr(self._store, "_repr_parts", None)
+        if callable(parts):
+            n_obs, n_vars, path, sections, x_line = parts()
+        else:
+            n_obs = getattr(self._store, "n_obs", None)
+            n_vars = getattr(self._store, "n_vars", None)
+            path, sections, x_line = getattr(self._store, "path", None), (), None
+        return _format_repr("AnnDataView", n_obs, n_vars, path, sections, x_line)
 
     @property
     def obs(self):

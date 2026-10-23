@@ -4,6 +4,64 @@ All notable changes to **cellstream** are documented here. The format is based o
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-10-22
+
+### Added
+
+- **`CellStore.update_obs(new_obs)` / `CellStore.update_var(new_var)`** -- edit a cell archive's
+  `obs` / `var` in place, the counterparts of `ShardedArchive.update_obs` / `update_var`. Only the
+  metadata tail is rewritten; `X` is never decoded or re-encoded. The store then re-reads its
+  footer and drops its cached frames, so it -- and an `AnnDataView` over it -- shows the edit at
+  once, and its payload mapping stays valid because nothing below `shard_region_end` moves. After
+  a failed edit the store also attempts the re-read, best effort; when it succeeds, an edit
+  interrupted mid-rewrite is rolled back from its backup. Any other handle opened before an edit
+  must be reopened. `new_obs` must keep the stored index and, on a
+  grouped archive, the `group_by` column's labels (see Fixed).
+- **`repr()` for `CellStore` and `AnnDataView`** -- anndata's backed layout:
+  `CellStore with n_obs × n_vars = N × M backed at '<path>'`, then one indented line per non-empty
+  slot (`obs`, `var`, `uns`, `obsm`, `varm`, `obsp`, `varp`) with quoted names, and a closing
+  line such as `X: uint16 on disk, reads as float32`, because the stored value width can differ
+  from what `.X[rows]` returns. The names come from member metadata alone -- the parquet footer for obs,
+  HDF5 group listings for header.h5ad (new `PackedArchive.obs_columns()` / `header_keys()`) --
+  never from reading obs.parquet or materialising the header AnnData: on a 6.8 M-cell archive those
+  two reads cost 29 s and 12.5 GiB, and a notebook runs the repr on every implicit display; the
+  metadata path takes ~100 ms there and leaves the store's caches untouched. A slot already cached
+  on the store is listed from the cache, so a key added through `store.uns[...]` shows up as it
+  would on an AnnData. `AnnDataView` prints the same lines under its own name.
+
+### Fixed
+
+- **`update_obs_packed` / `update_var_packed` work on `layout="cell"` archives.** Both raised
+  `NotImplementedError` on every cell archive: the tail rewrite carried only the shard layout's
+  data members across, and a cell archive keeps its matrix in `x_payload`, `x_offsets` and
+  `x_indptr` -- which lie below `shard_region_end`, where the rewrite truncates, so their bytes
+  were never at risk. The rewrite now keeps every member stored wholly below that boundary with
+  its footer entry unchanged, and refuses by the same position rule anything the truncation would
+  delete, plus a member below the boundary under one of the four re-emitted metadata names, which
+  would otherwise appear twice in the footer. Editing a cell archive's `var` or `obs` no longer
+  takes a full decode and re-encode; `docs/format.md` section 2.4 now specifies the edit.
+  `update_obs` also compares the new index with obs.parquet's, not only with the header's string
+  `obs_names`: an archive the push writer finalized from a default integer index stores it as
+  `int64` in obs.parquet, and the obs a reader returned for it was refused as a reordering. Both
+  comparisons are exact.
+- **`update_obs` refuses an edit that would leave a grouped archive's groups stale.** The edit
+  carries `groups.json` over unchanged, yet accepted a new `obs` whose `group_by` column was
+  relabelled or dropped, so `read_group()` / `group_spans()` kept serving the stored groups for
+  rows `obs` now labelled otherwise, or not at all -- on the shard layout all along, and on
+  `layout="cell"` once the fix above made its edits work. `update_obs_packed`,
+  `ShardedArchive.update_obs` and `CellStore.update_obs` now refuse such an `obs` before the tail
+  is rewritten. Labels are compared as the writer names groups -- every missing flavour is one
+  label -- so a dtype change that keeps every label is still accepted; a missing value is kept
+  apart from the literal `"nan"`, which archives from older writers can name differently. The new
+  column passes if it matches either stored copy of `obs` -- on pandas 2 the header's and
+  obs.parquet's can name one group `1` and `1.0` -- obs.parquet's only while it groups the rows
+  exactly as the header's does, since a lossy read-back can merge two groups. Relabelling or
+  regrouping needs a re-write.
+- **`update_var` no longer changes `obs`**, on either layout. The tail rewrite rebuilt
+  obs.parquet from the header's copy of obs, and anndata stores repeated strings in an h5ad as
+  categoricals, so a plain string column of `obs` came back as `category` from an edit that never
+  touched it. An `update_var` now carries obs.parquet over byte-for-byte.
+
 ## [0.10.0] — 2026-09-04
 
 ### Added
@@ -325,6 +383,7 @@ placeholder was uploaded to PyPI in July 2026 to reserve the name and contains n
   (`mudata`) reads belong to that layout, not to the per-cell store.
 - **`.layers` and `.raw` are not stored** by the per-cell layout.
 
+[0.11.0]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.11.0
 [0.10.0]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.10.0
 [0.9.2]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.2
 [0.9.1]: https://github.com/ArcInstitute/cellstream/releases/tag/v0.9.1

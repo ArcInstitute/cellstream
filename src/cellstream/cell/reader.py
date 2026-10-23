@@ -9,6 +9,7 @@ is a non-issue). Bulk read (spawn pool over row-ranges) lives in read_cell_bulk.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -25,7 +26,7 @@ from cellstream.v2.reader_cpu import _open_member_mmap
 
 from . import format as fmt
 from .codec import codec_for
-from .view import AnnDataView
+from .view import AnnDataView, _format_repr
 
 _I32MAX = int(np.iinfo(np.int32).max)
 
@@ -321,6 +322,43 @@ class CellStore:
         self._varm = None
         self._obsp = None
         self._varp = None
+
+    def _repr_parts(self):
+        """What ``__repr__`` prints, gathered without reading obs or materialising the header.
+
+        A slot whose frame is already cached (``self._obs`` etc.) is listed from the cache, so
+        a key added through ``store.uns[...]`` shows up as it would on an AnnData. Everything
+        else comes from member metadata -- the parquet footer for obs, HDF5 group listings for
+        header.h5ad -- via :meth:`PackedArchive.obs_columns` / :meth:`PackedArchive.header_keys`.
+        Going through ``self.obs`` / ``self.var`` instead would read the whole obs.parquet and
+        ``read_h5ad`` the whole header: measured at 29 s and 12.5 GiB of RSS on a 6.8 M-cell
+        production archive, on every implicit notebook display (#336). Also the seam
+        :class:`AnnDataView` uses, so the two reprs cannot drift apart.
+        """
+        obs = list(self._obs.columns) if self._obs is not None else self._packed.obs_columns()
+        cached = {
+            "var": None if self._var is None else list(self._var.columns),
+            "uns": None if self._uns is None else list(self._uns),
+            "obsm": None if self._obsm is None else list(self._obsm),
+            "varm": None if self._varm is None else list(self._varm),
+            "obsp": None if self._obsp is None else list(self._obsp),
+            "varp": None if self._varp is None else list(self._varp),
+        }
+        if any(v is None for v in cached.values()):
+            meta = self._packed.header_keys()
+            cached = {k: meta[k] if v is None else v for k, v in cached.items()}
+        sections = [("obs", obs), *cached.items()]
+        # The on-disk value width is not what `.X[rows]` returns: gather_rows widens integer
+        # counts and float32 to float32 (float64 stays float64) unless out_dtype asks otherwise.
+        # Both facts, labelled, rather than a bare "(uint16)" that reads as numpy's dtype.
+        x_line = (
+            f"{self.manifest['value_dtype_on_disk']} on disk, "
+            f"reads as {np.dtype(self._x_out_dtype).name}"
+        )
+        return self.n_obs, self.n_vars, self.path, sections, x_line
+
+    def __repr__(self):
+        return _format_repr("CellStore", *self._repr_parts())
 
     @property
     def _decoder(self):
@@ -907,6 +945,54 @@ class CellStore:
         if self._varp is None:
             self._varp = dict(self._header().varp)
         return self._varp
+
+    def update_obs(self, new_obs, *, unsafe_no_lock: bool = False) -> None:
+        """Replace the archive's ``obs`` in place, then refresh this store.
+
+        ``new_obs`` must keep the stored rows in order -- the same index -- and, on a grouped
+        archive, the ``group_by`` column's labels, which ``groups.json`` was planned from and
+        which the edit does not rebuild (#339). Only the metadata tail is rewritten
+        (docs/format.md section 2.4, via
+        :func:`cellstream.packed.writer.update_obs_packed`); ``X`` is not touched. This store
+        then re-reads the footer and drops its cached metadata. Any other handle opened on the
+        archive before the edit -- another ``CellStore``, a reader in another process -- still
+        holds the old metadata offsets and must be reopened.
+        """
+        from cellstream.packed.writer import update_obs_packed
+
+        self._edit_metadata(update_obs_packed, new_obs, unsafe_no_lock)
+
+    def update_var(self, new_var, *, unsafe_no_lock: bool = False) -> None:
+        """Replace the archive's ``var`` in place, then refresh this store. ``new_var`` must keep
+        the stored feature order; otherwise as :meth:`update_obs`."""
+        from cellstream.packed.writer import update_var_packed
+
+        self._edit_metadata(update_var_packed, new_var, unsafe_no_lock)
+
+    def _edit_metadata(self, update, frame, unsafe_no_lock) -> None:
+        """Run ``update`` on this archive, then re-read its footer and drop every cached frame.
+
+        The payload mmap and the offsets / indptr arrays stay: they come from members stored
+        below shard_region_end, which an edit leaves in place byte-for-byte, footer entries
+        included. The footer is re-read when the edit fails, too. A refused edit changed nothing;
+        one that failed after truncating left a .tailbak, which that reopen applies, restoring
+        the tail the old footer describes. Best effort there -- the edit's own error is the one to
+        report.
+        """
+        try:
+            update(self.path, frame, unsafe_no_lock=unsafe_no_lock)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                self._reload_metadata()
+            raise
+        self._reload_metadata()
+
+    def _reload_metadata(self) -> None:
+        self._packed = PackedArchive(self.path)
+        self.manifest = self._packed.manifest
+        self._obs = self._var = self._uns = self._hdr = None
+        self._obsm = self._varm = self._obsp = self._varp = None
+        self._groups = None
 
     @property
     def shape(self):

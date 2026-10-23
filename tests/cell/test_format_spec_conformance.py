@@ -569,29 +569,40 @@ def test_every_writer_satisfies_the_open_time_invariants(tmp_path):
             store.close()
 
 
-def test_cell_metadata_is_immutable(tmp_path):
-    """Section 2.4: the tail-rewrite editing path refuses a cell archive rather than dropping
-    its data members, and CellStore exposes no editing surface at all.
+def test_cell_metadata_edit_rewrites_only_the_tail(tmp_path):
+    """Section 2.4: a metadata edit -- here ``CellStore.update_obs``, which calls the packed
+    writer's update_obs_packed -- truncates at shard_region_end and re-appends the metadata
+    region, so every byte below the boundary -- the head block and the three data members -- is
+    unchanged, and so are those members' footer entries.
 
-    The rewrite re-emits members by role and by a fixed list of metadata names; `payload` /
-    `offsets` / `indptr` are in neither set, so a successful rewrite would delete them and
-    unlink the .tailbak that could restore them. The guard is what makes that unreachable.
+    Until #338 the rewrite carried data members by the shard layout's role only, so it refused
+    every cell archive rather than delete x_payload / x_offsets / x_indptr.
     """
-    from cellstream.packed.writer import update_obs_packed
+    import io
 
-    path = _write(tmp_path, "pfordelta")
+    path = _write(tmp_path, "pfordelta_grouped")
+    before = _SpecReader(path)
     store = cellstream.open(path)
     try:
         new_obs = store.obs.copy()
-        assert not hasattr(store, "update_obs")
-        assert not hasattr(store, "update_var")
+        new_obs["added"] = 1
+        store.update_obs(new_obs)
     finally:
         store.close()
-    new_obs["added"] = 1
-    before = path.read_bytes()
-    with pytest.raises(NotImplementedError, match="x_payload"):
-        update_obs_packed(path, new_obs)
-    assert path.read_bytes() == before, "the refused update must not have touched the archive"
+
+    after = _SpecReader(path)
+    sre = before.shard_region_end
+    assert after.shard_region_end == sre
+    assert after.raw[:sre] == before.raw[:sre], "the edit changed a byte below shard_region_end"
+    data = ("x_payload", "x_offsets", "x_indptr")
+    assert [after.members[n] for n in data] == [before.members[n] for n in data]
+    assert after.member_order == before.member_order  # sec 2.3: the data members still lead
+    assert after.member("manifest.json") == before.member("manifest.json")
+    assert after.member("groups.json") == before.member("groups.json")
+    assert (after.to_csr() != before.to_csr()).nnz == 0
+    obs = pd.read_parquet(io.BytesIO(after.member("obs.parquet")))
+    assert list(obs.index) == list(new_obs.index) and (obs["added"] == 1).all()
+    assert not path.with_suffix(path.suffix + ".tailbak").exists(), "the edit did not complete"
 
 
 def test_appendix_a_numbers(tmp_path):

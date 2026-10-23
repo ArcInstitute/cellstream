@@ -247,6 +247,113 @@ def _adata_header_bytes(header_adata) -> bytes:
         Path(tmpname).unlink(missing_ok=True)
 
 
+def _parquet_obs_index(pa):
+    """The index of ``pa``'s obs.parquet -- what a reader's obs returns -- read without its
+    columns, through a window over the archive rather than a copy of the whole member."""
+    import pandas as pd
+
+    with pa._member_window("obs.parquet") as w:
+        return pd.read_parquet(w, columns=[]).index
+
+
+def _parquet_obs_column(pa, name):
+    """One column of ``pa``'s obs.parquet, read alone through a window over the archive."""
+    import pandas as pd
+
+    with pa._member_window("obs.parquet") as w:
+        return pd.read_parquet(w, columns=[name])[name]
+
+
+def _group_labels(col):
+    """Each row's group label as the writer names it (stringify_group_labels), except that a
+    missing value is None rather than the "nan" sentinel, so it is told apart from that literal.
+
+    To a writer of this version a missing label and the literal "nan" are one group (#294), but a
+    writer before it named missing rows 'None' or '<NA>', so swapping the literal in for them
+    would give those rows a label no record carries -- and a column holding both is one
+    validate_group_label_collision refuses to write at all. Missing flavours still compare equal
+    to each other: None, NaN and pd.NA are the same missing label here.
+    """
+    from cellstream.grouping import stringify_group_labels
+
+    labels = stringify_group_labels(col)
+    labels[col.isna().to_numpy()] = None
+    return labels
+
+
+def _shown(label) -> str:
+    return "missing" if label is None else repr(label)
+
+
+def _same_partition(a, b) -> bool:
+    """True if label arrays ``a`` and ``b`` group the rows alike: two rows share a label in one
+    exactly when they share one in the other."""
+    pairs = set(zip(a.tolist(), b.tolist(), strict=True))
+    return len(pairs) == len(set(a.tolist())) == len(set(b.tolist()))
+
+
+def _refuse_group_by_change(pa, group_by, header_obs, new_obs) -> None:
+    """Raise if ``new_obs`` drops the ``group_by`` column or gives any row another group label.
+
+    The tail rewrite carries groups.json over byte-for-byte, and with it the spans read_group()
+    and group_spans() serve, so obs must keep the labels those spans were planned from. Accepted
+    before this check, a relabelled or dropped column left them serving the stored groups for rows
+    obs labelled otherwise, or not at all (#339).
+
+    Labels are compared the way the writer names groups (see _group_labels), not value for value,
+    so a dtype change that keeps every label moves no row and is accepted. They are compared with
+    the column as the archive stores it, in EITHER copy: the header's obs, already read, or
+    obs.parquet's -- what a reader's obs returns -- read only when the header's does not match.
+    The two can name the same groups differently: on pandas 2 an integer categorical with a
+    missing value stays categorical in the h5ad ('1') but reads back from parquet as float64
+    ('1.0'), so an unchanged column must pass from either -- obs.parquet's while it groups the rows
+    as the header's does. Not against groups.json's labels: an archive written before #294 can
+    name a missing label 'None' or '<NA>' there.
+    """
+    if group_by not in new_obs.columns:
+        raise ValueError(
+            f"new_obs has no {group_by!r} column, but the archive is grouped by it: groups.json, "
+            "which read_group() and group_spans() serve, is kept as written, so obs must keep "
+            "that column. Regrouping needs a re-write."
+        )
+    new = _group_labels(new_obs[group_by])
+    copies = {}
+    if group_by in header_obs.columns:
+        header = _group_labels(header_obs[group_by])
+        if (header == new).all():
+            return
+        copies["header.h5ad"] = header
+    if pa.has_member("obs.parquet") and group_by in pa.obs_columns():
+        parquet = _group_labels(_parquet_obs_column(pa, group_by))
+        # A copy to match only if it groups the rows as the header does. A read-back can be lossy
+        # enough to merge groups the header and groups.json keep apart -- integer categories
+        # 2**53 and 2**53 + 1 come back from parquet as one float64 -- and matching it would
+        # write that merge into both copies. (codex.)
+        if "header.h5ad" not in copies or _same_partition(copies["header.h5ad"], parquet):
+            if (parquet == new).all():
+                return
+            copies["obs.parquet"] = parquet
+    if not copies:
+        raise ValueError(
+            f"the archive is grouped by {group_by!r}, but its stored obs has no {group_by!r} "
+            "column (an update_obs made before #339 could drop it), so new_obs cannot be checked "
+            "against the labels groups.json was written from. Re-write the archive."
+        )
+    # Reported against the copy the new column is closest to, which is named: measured against
+    # the other, rows the edit never touched can differ too ('1' against '1.0'). (codex.)
+    mismatch = {name: labels != new for name, labels in copies.items()}
+    name = min(mismatch, key=lambda k: int(mismatch[k].sum()))
+    changed = mismatch[name].nonzero()[0]
+    i = int(changed[0])
+    raise ValueError(
+        f"new_obs[{group_by!r}] changes the group label of {changed.size} of {len(new)} rows "
+        f"against the stored column in {name} (first: row {i}, {new_obs.index[i]!r}, "
+        f"{_shown(copies[name][i])} -> {_shown(new[i])}), but the archive is grouped by that "
+        "column: groups.json, which read_group() and group_spans() serve, is kept as written. "
+        "Relabelling needs a re-write."
+    )
+
+
 def _obs_parquet_bytes(obs) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tf:
         tmpname = tf.name
@@ -257,10 +364,10 @@ def _obs_parquet_bytes(obs) -> bytes:
         Path(tmpname).unlink(missing_ok=True)
 
 
-# The exact non-shard member NAMES _update_metadata_packed's tail rewrite re-emits; shard
-# members are carried over verbatim alongside them. Keep in sync with the metadata_blobs
-# list in _update_metadata_packed -- _unpreservable_members reads this to decide what the
-# rewrite would destroy.
+# The exact member NAMES _update_metadata_packed's tail rewrite re-emits; every member stored
+# below shard_region_end is carried over verbatim alongside them. Keep in sync with the
+# metadata_blobs list in _update_metadata_packed -- _unpreservable_members reads this to decide
+# what the rewrite would destroy.
 #
 # NAMES, not roles. A role allowlist is not sufficient: the rewrite emits fixed names, so a
 # member with an ALLOWED role but a different name (role="manifest", name="manifest2.json")
@@ -272,21 +379,41 @@ _REWRITTEN_METADATA_NAMES = frozenset(
 )
 
 
-def _unpreservable_members(members):
-    """Names in ``members`` that _update_metadata_packed's tail rewrite would NOT re-emit.
+def _below_region_end(member, shard_region_end) -> bool:
+    """True if ``member`` lies wholly below ``shard_region_end``. The tail rewrite truncates
+    there, so these bytes survive it unchanged and the member's footer entry stays valid as is."""
+    return member["offset"] + member["length"] <= shard_region_end
+
+
+def _unpreservable_members(members, shard_region_end):
+    """Names in ``members`` that _update_metadata_packed's tail rewrite would NOT carry over.
+
+    The rewrite keeps every member stored below ``shard_region_end`` -- bytes and footer entry
+    unchanged -- and re-emits _REWRITTEN_METADATA_NAMES; anything else is deleted. A member below
+    the boundary under one of those names is reported too: the rewrite would emit the name a
+    second time, and a footer with a duplicate member name does not open.
+
+    By position, not by role (#338). The packer writes the data members first -- v2 shards, the
+    cell layout's payload / offsets / indptr -- and starts shard_region_end at the first member of
+    any other role, so on every archive today's writers produce the two rules agree; but the
+    position is what the truncation actually preserves. The role rule this replaces kept only
+    role == "shard" and so refused every cell archive, and one widened to _IMMUTABLE_ROLES would
+    still keep the entry of a data member stored PAST the boundary, whose bytes the truncation
+    destroys.
 
     Split out from the guard so the rule is unit-testable without building an archive.
     """
-    preserved = {m["name"] for m in members if m.get("role") == "shard"}
-    preserved |= _REWRITTEN_METADATA_NAMES
-    return sorted({m["name"] for m in members if m["name"] not in preserved})
+    kept = {m["name"] for m in members if _below_region_end(m, shard_region_end)}
+    lost = {m["name"] for m in members} - kept - _REWRITTEN_METADATA_NAMES
+    return sorted(lost | (kept & _REWRITTEN_METADATA_NAMES))
 
 
-def _finalize_tail(fh, shard_entries, metadata_blobs, shard_region_end):
+def _finalize_tail(fh, kept_entries, metadata_blobs, shard_region_end):
     """Append metadata members (4 KB-aligned) + footer + trailer to ``fh`` (already
-    seeked/truncated to shard_region_end). ``metadata_blobs`` is a list of
-    (name, role, bytes). Returns nothing; fh is fsynced by the caller."""
-    footer_members = list(shard_entries)  # shard entries unchanged (offset < sre)
+    seeked/truncated to shard_region_end). ``kept_entries`` are the footer entries of the
+    members stored below shard_region_end, re-emitted unchanged; ``metadata_blobs`` is a list
+    of (name, role, bytes). Returns nothing; fh is fsynced by the caller."""
+    footer_members = list(kept_entries)
     for name, role, blob in metadata_blobs:
         pos = fh.tell()
         pad = fmt.align_up(pos) - pos
@@ -321,10 +448,10 @@ def _update_metadata_packed(file, *, new_obs=None, new_var=None, unsafe_no_lock=
         # this same flock).
         _apply_recovery(file)
         pa = PackedArchive(file, _recover=False)
-        # Fail before the tail rewrite. The rewrite below re-emits role=="shard" members plus
-        # a FIXED list of four metadata blobs BY NAME, so any other member is dropped when the
-        # tail is truncated -- and the .tailbak that could restore it is unlinked on the
-        # success path, so the loss is unrecoverable.
+        # Fail before the tail rewrite. The rewrite below keeps the members stored below
+        # shard_region_end and re-emits a FIXED list of four metadata blobs BY NAME, so any other
+        # member is dropped when the tail is truncated -- and the .tailbak that could restore it
+        # is unlinked on the success path, so the loss is unrecoverable.
         #
         # Reproduced on a v4 multi-matrix archive: update_obs() returned SUCCESSFULLY,
         # destroyed var/x.parquet and var/raw.parquet, removed the .tailbak, and left the
@@ -340,16 +467,18 @@ def _update_metadata_packed(file, *, new_obs=None, new_var=None, unsafe_no_lock=
         # exclusive flock. What is guaranteed is that the REQUESTED update does not rewrite the
         # tail. On a clean archive -- the case that matters -- the packed archive file itself is
         # not modified, though the .lock sidecar is still written. (codex review of #254.)
-        unpreservable = _unpreservable_members(pa.members)
+        sre = pa.shard_region_end
+        unpreservable = _unpreservable_members(pa.members, sre)
         if unpreservable:
             raise NotImplementedError(
-                f"{file}: update_obs/update_var does not preserve {unpreservable}, and "
-                "rewriting the archive tail would delete them permanently. Multi-matrix "
-                "(v4) archives carry per-family var/ and meta/ sidecars that this path "
-                "cannot round-trip yet (project issue #254). The requested update did not rewrite "
-                "the tail."
+                f"{file}: update_obs/update_var does not preserve {unpreservable}. The tail "
+                "rewrite keeps only the members stored below shard_region_end and re-emits "
+                "header.h5ad, obs.parquet, manifest.json and groups.json by name, so any other "
+                "member would be deleted permanently (and one stored below the boundary under one "
+                "of those names would be emitted twice). Multi-matrix (v4) archives' per-family "
+                "var/ and meta/ sidecars are the known case (project issue #254). The requested "
+                "update did not rewrite the tail."
             )
-        sre = pa.shard_region_end
         header_adata = pa.header_adata()
         if new_obs is not None:
             if len(new_obs) != header_adata.n_obs:
@@ -359,11 +488,24 @@ def _update_metadata_packed(file, *, new_obs=None, new_var=None, unsafe_no_lock=
             # Match the directory update path: the index (obs_names / row order)
             # must be preserved — we don't reorder cells, and reordering would
             # misalign obs with the stored X rows.
-            if not new_obs.index.equals(header_adata.obs.index):
+            #
+            # Exactly, against either index the archive stores: the header's obs_names, or
+            # obs.parquet's -- what a reader's obs returns. They differ when a writer was handed a
+            # non-string index: anndata stringifies the header's names, while obs.parquet keeps
+            # the index as given (the push writer stores a default integer index as int64), so
+            # `store.obs` plus a column matched neither until it was compared with obs.parquet's
+            # (#338). Never a string cast of both: it makes the label "nan" equal to a missing
+            # label, which let a swap of those two rows through. (codex.)
+            if not new_obs.index.equals(header_adata.obs.index) and not (
+                pa.has_member("obs.parquet") and new_obs.index.equals(_parquet_obs_index(pa))
+            ):
                 raise ValueError(
                     "new_obs index does not match the archive's obs index; "
                     "obs row order must be preserved (we don't reorder cells)."
                 )
+            # After the index check, so the stored and new rows line up.
+            if pa.manifest.get("group_by") is not None:
+                _refuse_group_by_change(pa, pa.manifest["group_by"], header_adata.obs, new_obs)
             header_adata.obs = new_obs
         if new_var is not None:
             if len(new_var) != header_adata.n_vars:
@@ -377,10 +519,26 @@ def _update_metadata_packed(file, *, new_obs=None, new_var=None, unsafe_no_lock=
                 )
             header_adata.var = new_var
 
-        shard_entries = [m for m in pa.members if m["role"] == "shard"]
+        # Every member below sre keeps its footer entry: the truncation never touches its bytes.
+        # That is v2 shards, and a cell archive's x_payload / x_offsets / x_indptr -- which the
+        # role == "shard" filter this replaces left out, so the guard refused every cell archive
+        # (#338). Footer order is kept.
+        kept_entries = [m for m in pa.members if _below_region_end(m, sre)]
+        if new_obs is not None:
+            # From the frame as given, like the writers do -- not from the header's copy, whose
+            # index anndata may have stringified.
+            obs_blob = _obs_parquet_bytes(new_obs)
+        elif pa.has_member("obs.parquet"):
+            # An update_var leaves obs alone, so obs.parquet is carried over byte-for-byte.
+            # Rebuilding it from header_adata.obs -- the HEADER's copy -- changed its dtypes:
+            # anndata stores repeated strings in an h5ad as categoricals, so a string column of
+            # obs came back as `category` from an edit that never touched obs (#338).
+            obs_blob = pa.member_bytes("obs.parquet")
+        else:
+            obs_blob = _obs_parquet_bytes(header_adata.obs)
         metadata_blobs = [
             ("header.h5ad", "header", _adata_header_bytes(header_adata)),
-            ("obs.parquet", "obs", _obs_parquet_bytes(header_adata.obs)),
+            ("obs.parquet", "obs", obs_blob),
             ("manifest.json", "manifest", pa.member_bytes("manifest.json")),
         ]
         if pa.has_member("groups.json"):
@@ -408,7 +566,7 @@ def _update_metadata_packed(file, *, new_obs=None, new_var=None, unsafe_no_lock=
         with file.open("r+b") as fh:
             fh.seek(sre)
             fh.truncate(sre)
-            _finalize_tail(fh, shard_entries, metadata_blobs, sre)
+            _finalize_tail(fh, kept_entries, metadata_blobs, sre)
             fh.flush()
             os.fsync(fh.fileno())
         tailbak.unlink(missing_ok=True)

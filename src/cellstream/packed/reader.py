@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 from cellstream.errors import IncompatibleSchemaError, PackedArchiveError
@@ -244,6 +245,13 @@ class _MmapWindow:
     def readable(self) -> bool:
         return True
 
+    @property
+    def closed(self) -> bool:
+        # pyarrow wraps a Python file-like in PythonFile, which consults ``closed`` before every
+        # read; without it ParquetFile fails with "I/O operation on closed file" (#336). The
+        # window has no close() of its own -- its lifetime is the mmap's -- so report the mmap's.
+        return self._mm.closed
+
     def writable(self) -> bool:
         return False
 
@@ -471,6 +479,74 @@ class PackedArchive:
         from cellstream.matrices import meta_member_name
 
         return self.member_bytes(meta_member_name(key))
+
+    @contextmanager
+    def _member_window(self, name: str):
+        """A read-only, seekable file-like over one member -- ``[offset, offset+length)`` of a
+        private mmap of the archive -- for readers that want a *file*, not the member's bytes.
+
+        :meth:`member_bytes` copies the whole member into RAM; for ``obs.parquet`` and
+        ``header.h5ad`` on a production archive that is several GiB each, which is exactly what
+        the metadata-only readers below exist to avoid. The mmap is unmapped on exit, so the
+        window must not be used after the ``with`` block (#336).
+        """
+        import mmap
+
+        if name not in self._by_name:
+            raise PackedArchiveError(f"{self.path}: member {name!r} not found")
+        m = self._by_name[name]
+        with self.path.open("rb") as fh:
+            mm = mmap.mmap(fh.fileno(), 0, prot=mmap.PROT_READ)
+            try:
+                yield _MmapWindow(mm, m["offset"], m["length"])
+            finally:
+                mm.close()
+
+    def obs_columns(self) -> list[str]:
+        """Column names of the ``obs.parquet`` member, from its footer alone.
+
+        Reads the parquet schema, not the row groups, so the cost is independent of ``n_obs``.
+        Index columns are dropped using the footer's pandas metadata, which makes the result
+        equal to ``pd.read_parquet(<member>).columns`` without the read (#336).
+        """
+        import pyarrow.parquet as pq
+
+        with self._member_window("obs.parquet") as w:
+            schema = pq.read_schema(w)
+        meta = schema.pandas_metadata or {}
+        # A stored index is named by its field; a RangeIndex is a dict (start/stop/step) that
+        # occupies no column. Only the str entries name something to drop.
+        index_fields = {c for c in meta.get("index_columns", ()) if isinstance(c, str)}
+        return [n for n in schema.names if n not in index_fields]
+
+    def header_keys(self) -> dict[str, list[str]]:
+        """Names in the ``header.h5ad`` member -- the ``var`` columns and the keys of ``uns``,
+        ``obsm``, ``varm``, ``obsp`` and ``varp`` -- from HDF5 metadata alone.
+
+        Group listings and attributes only; no dataset is read. :meth:`header_adata`, by
+        contrast, materialises the whole header (its obs copy, every annotation matrix). The
+        ``var`` columns come from anndata's ``column-order`` attribute, the same source
+        ``anndata.read_h5ad`` orders them by; a header written before that attribute existed
+        falls back to the group's keys minus the index (#336).
+        """
+        import h5py
+
+        def _s(x):
+            return x.decode() if isinstance(x, bytes) else str(x)
+
+        out: dict[str, list[str]] = {}
+        with self._member_window("header.h5ad") as w, h5py.File(w, "r") as f:
+            var = f.get("var")
+            cols = None if var is None else var.attrs.get("column-order")
+            if cols is None:
+                index_name = None if var is None else var.attrs.get("_index")
+                skip = {"_index", "__categories", None if index_name is None else _s(index_name)}
+                cols = [] if var is None else [k for k in var.keys() if k not in skip]
+            out["var"] = [_s(c) for c in cols]
+            for slot in ("uns", "obsm", "varm", "obsp", "varp"):
+                g = f.get(slot)
+                out[slot] = [] if g is None else list(g.keys())
+        return out
 
     def header_adata(self):
         """Return the header AnnData (X empty), read directly from an mmap window.

@@ -177,32 +177,45 @@ UTF-8 JSON:
   `offsets`, `indptr` — i.e. the boundary between the immutable data region and the metadata
   region. It is 4 KB-aligned because member offsets are.
 
-The split exists so metadata can be edited without rewriting the data: `update_obs` /
-`update_var` truncate the file at `shard_region_end` and re-append the metadata region, footer
-and trailer, leaving the payload untouched.
+The split exists so metadata can be edited without rewriting the data. The reference
+implementation's `update_obs_packed` / `update_var_packed` (`cellstream.packed.writer`) truncate
+the file at `shard_region_end` and re-append the metadata region, footer and trailer:
 
-**That editing path is not available for a cell archive.** The rewrite re-emits members by
-ROLE and by a fixed list of metadata NAMES, and a cell archive's three data members
-(`x_payload` / `x_offsets` / `x_indptr`) are in neither set — so it refuses rather than
-silently dropping them. Measured: `update_obs_packed` on a `layout="cell"` archive raises
-`NotImplementedError: … does not preserve ['x_indptr', 'x_offsets', 'x_payload'] …`, and
-`CellStore` exposes no `update_obs` / `update_var` at all. Cell metadata is therefore
-effectively immutable once written; rewrite the archive to change it. The region split still
-matters to a reader for the reasons below.
+* Every member stored wholly below `shard_region_end` — for a cell archive `x_payload`,
+  `x_offsets` and `x_indptr` — keeps its bytes and its footer entry exactly; no byte below the
+  boundary changes.
+* `header.h5ad` is rewritten, and so is `obs.parquet` when `obs` changes; an edit of `var` alone
+  carries `obs.parquet` over byte-for-byte. `manifest.json` and `groups.json` are always carried
+  over byte-for-byte.
+* If the archive holds any other member — one not wholly below the boundary, under a name other
+  than those four — the edit refuses before truncating anything, since the rewrite would delete
+  it. It also refuses a member below the boundary that carries one of those four names, which the
+  rewrite would emit a second time.
+* On a grouped archive (`manifest["group_by"]` non-`null`), an `obs` edit also refuses a new
+  `obs` that lacks the `group_by` column or gives any row a different group label, again before
+  truncating anything: `groups.json` is carried over as written, so it would no longer describe
+  `obs`. A row's label is read as §8 names it, except that a missing value stays distinct from
+  the literal `"nan"`, and the new column passes if it matches the stored one in either
+  `header.h5ad` or `obs.parquet`, which can name the same group differently — `obs.parquet`'s
+  only while it groups the rows exactly as `header.h5ad`'s does, since a lossy read-back can merge
+  two groups. A dtype change that keeps every label is accepted; relabelling or regrouping needs
+  a re-write.
+
+`CellStore.update_obs` / `update_var` call those two functions and then re-read that store's
+footer; any other handle opened before an edit must be reopened.
 
 Consequences a reader should know about:
 
 * The metadata region's byte offsets are **not stable** across a metadata edit. Never cache
   them across a reopen.
 * Mid-edit crash safety uses a sidecar `<file>.tailbak`, holding a `u64` `shard_region_end`
-  followed by the previous tail bytes. Only a tail rewrite creates one, so for a cell archive
-  this path is dormant — but the recovery check runs on every open, so a reader must still
-  handle the sidecar correctly if one is present. On open, if a `.tailbak` exists and the current trailer
-  does *not* validate, the tail is rolled back from the backup; if the trailer *does* validate,
-  the edit completed and the backup is stale. Recovery takes the archive's write lock
-  (`<file>.lock`, an `flock`), so a reader cannot roll back a live writer's in-progress edit.
-  A `.tailbak` whose recorded `shard_region_end` is out of range or not 4 KB-aligned MUST be
-  refused rather than used to truncate the file.
+  followed by the previous tail bytes. Only a tail rewrite creates one, and the recovery check
+  runs on every open, so a reader must handle the sidecar correctly if one is present. On open,
+  if a `.tailbak` exists and the current trailer does *not* validate, the tail is rolled back
+  from the backup; if the trailer *does* validate, the edit completed and the backup is stale.
+  Recovery takes the archive's write lock (`<file>.lock`, an `flock`), so a reader cannot roll
+  back a live writer's in-progress edit. A `.tailbak` whose recorded `shard_region_end` is out
+  of range or not 4 KB-aligned MUST be refused rather than used to truncate the file.
 * An interrupted *initial* write never publishes a partial archive: the writer assembles into
   `<name>.<pid>.<uuid4>.tmp` opened `O_EXCL`, `fsync`s, then `os.replace`s into place.
 
