@@ -11,6 +11,8 @@ acquire_write_lock on their own fd and get exactly what a second process sees.
 
 from __future__ import annotations
 
+import shutil
+
 import anndata as ad
 import numpy as np
 import pandas as pd
@@ -317,3 +319,70 @@ def test_failed_write_releases_the_lock(tmp_path):
         write_cell_archive(bad, out)
     with _held(out):
         pass
+
+
+# --- no sidecar left behind (ArcInstitute/cellstream#2) ----------------------
+
+
+def test_successful_write_leaves_only_the_archive(tmp_path):
+    """A finished write must publish ONE file: no <out>.lock, no cellstream_cell_* staging.
+
+    A leftover `.lock` beside the archive is what forced one ``rm`` before every publish in
+    arc-vca2, and a leftover staging directory was sealed into an immutable dataset version.
+    """
+    out = tmp_path / "nosidecar.shad"
+    write_cell_archive(_adata(), out)
+    assert out.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == [out.name]
+
+
+def test_aborted_writer_leaves_only_its_removed_output(tmp_path):
+    """abort() may leave the dead <out> behind, but never the lock sidecar beside it."""
+    out = tmp_path / "abort.shad"
+    w = CellArchiveWriter(out, n_vars=N_VARS, value_dtype="int32")
+    w.add_block(_adata(n_obs=4).X)
+    w.abort()
+    assert not out.with_suffix(out.suffix + ".lock").exists()
+
+
+def test_failed_write_leaves_no_lock_sidecar(tmp_path):
+    out = tmp_path / "faillock.shad"
+    bad = _adata(n_obs=4)
+    bad.X = sp.csr_matrix(
+        (
+            np.array([1, 2], dtype=np.int32),
+            np.array([0, N_VARS + 5], dtype=np.int32),
+            np.array([0, 2, 2, 2, 2], dtype=np.int32),
+        ),
+        shape=(4, N_VARS),
+    )
+    with pytest.raises(ValueError):
+        write_cell_archive(bad, out)
+    assert not out.with_suffix(out.suffix + ".lock").exists()
+
+
+def test_staging_leftover_is_named_in_a_warning(tmp_path, monkeypatch):
+    """A teardown that cannot remove staging must NAME it, not silently leave it and not raise.
+
+    Mimics NFS EBUSY: ``rmtree`` fails both attempts while the archive is already valid. Failing
+    the whole write would lose a successful archive; staying silent is how the leftovers reached
+    a published dataset version.
+    """
+    from cellstream.cell import writer as w
+
+    out = tmp_path / "busy.shad"
+    calls = {"n": 0}
+
+    def busy_rmtree(path, *a, **k):
+        calls["n"] += 1
+        raise OSError(16, "Device or resource busy")
+
+    monkeypatch.setattr(w.shutil, "rmtree", busy_rmtree)
+    with pytest.warns(UserWarning, match="could not remove the write staging directory"):
+        write_cell_archive(_adata(), out)
+    monkeypatch.undo()
+    assert calls["n"] == w._STAGING_REMOVE_ATTEMPTS
+    assert out.exists()
+    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(w._STAGING_PREFIX)]
+    assert len(leftovers) == 1  # warned about, and removable by the caller
+    shutil.rmtree(leftovers[0])  # exactly what the warning tells the caller to do

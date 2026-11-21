@@ -38,6 +38,87 @@ def test_lock_released_after_context(tmp_path):
         pass
 
 
+def test_lock_file_unlinked_after_release(tmp_path):
+    """The sidecar is removed on release: a finished write leaves nothing beside its output (#2)."""
+    from cellstream.lock import acquire_write_lock
+
+    lock = tmp_path / "out.shad.lock"
+    with acquire_write_lock(lock, op="write"):
+        # Still present (and readable) while held -- the diagnostic body must not disappear early.
+        assert lock.exists()
+    assert not lock.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_lock_file_unlinked_when_the_body_raises(tmp_path):
+    """The unlink is in a finally, so an exception in the guarded block must not strand it."""
+    from cellstream.lock import acquire_write_lock
+
+    lock = tmp_path / "out.shad.lock"
+    with pytest.raises(RuntimeError):
+        with acquire_write_lock(lock, op="write"):
+            raise RuntimeError("caller blew up")
+    assert not lock.exists()
+
+
+def test_unsafe_no_lock_creates_no_file(tmp_path):
+    from cellstream.lock import acquire_write_lock
+
+    lock = tmp_path / "out.shad.lock"
+    with acquire_write_lock(lock, op="write", unsafe_no_lock=True):
+        assert not lock.exists()
+    assert not lock.exists()
+
+
+def test_acquire_retries_when_the_locked_inode_is_already_dead(tmp_path, monkeypatch):
+    """The unlink-vs-flock race, forced deterministically.
+
+    A process that opened the lock file just before the previous holder unlinked it gets a
+    descriptor to an inode no path names any more. ``flock`` on that dead inode SUCCEEDS (nobody
+    else can even reach it), so only the post-flock inode check can notice -- without it, two
+    writers would each "hold" a different inode and both proceed. Here the first ``open`` returns
+    exactly that dead descriptor.
+    """
+    from cellstream import lock as lock_mod
+
+    lock = tmp_path / "out.shad.lock"
+    dead = tmp_path / "dead.lock"
+    real_open = os.open
+    calls = []
+
+    def fake_open(path, flags, mode=0o777):
+        calls.append(path)
+        if len(calls) == 1:
+            fd = real_open(dead, flags, mode)
+            os.unlink(dead)  # live descriptor, no longer reachable through any path
+            return fd
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(lock_mod.os, "open", fake_open)
+    with lock_mod.acquire_write_lock(lock, op="write") as _:
+        assert len(calls) == 2
+        assert lock.exists()
+    assert not lock.exists()
+
+
+def test_held_inode_is_current_tracks_replacement(tmp_path):
+    """The guard itself, without the surrounding acquire: an inode is only 'current' while it is
+    the file the path resolves to."""
+    from cellstream.lock import _held_inode_is_current
+
+    lock = tmp_path / "out.shad.lock"
+    lock.write_text("held by nobody")
+    fd = os.open(lock, os.O_RDWR)
+    try:
+        assert _held_inode_is_current(fd, lock)
+        lock.unlink()
+        assert not _held_inode_is_current(fd, lock)  # path gone
+        lock.write_text("a different inode entirely")
+        assert not _held_inode_is_current(fd, lock)  # path reused
+    finally:
+        os.close(fd)
+
+
 def test_concurrent_writers_fail_loud(tmp_path):
     from cellstream.errors import ArchiveLockedError
     from cellstream.lock import acquire_write_lock
