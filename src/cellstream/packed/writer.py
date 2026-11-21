@@ -466,7 +466,8 @@ def _update_metadata_packed(file, *, new_obs=None, new_var=None, unsafe_no_lock=
         # completing a previously-interrupted update is correct and happens under this same
         # exclusive flock. What is guaranteed is that the REQUESTED update does not rewrite the
         # tail. On a clean archive -- the case that matters -- the packed archive file itself is
-        # not modified, though the .lock sidecar is still written. (codex review of #254.)
+        # not modified; the .lock sidecar this acquired is unlinked on release, so it does not
+        # survive the call either. (codex review of #254, updated for #2.)
         sre = pa.shard_region_end
         unpreservable = _unpreservable_members(pa.members, sre)
         if unpreservable:

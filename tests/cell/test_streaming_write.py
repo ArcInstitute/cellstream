@@ -331,18 +331,21 @@ def test_wide_n_vars_uint32_indices(tmp_path):
 
 def test_tmp_dir_defaults_next_to_out_path(tmp_path, monkeypatch):
     """§7.4: tmp_dir defaults to out_path.parent, NOT TMPDIR -- the output filesystem must hold
-    the archive anyway, whereas /tmp typically cannot hold even 1x payload."""
+    the archive anyway, whereas /tmp typically cannot hold even 1x payload.
+
+    Spies on ``mkdtemp``, which is what the staging helper uses: teardown needs a retrying
+    ``rmtree`` (#2), so ``tempfile.TemporaryDirectory`` is no longer on this path.
+    """
     import tempfile as _tf
 
     seen = []
-    real = _tf.TemporaryDirectory
+    real = _tf.mkdtemp
 
-    class _Spy(real):
-        def __init__(self, *args, **kw):
-            seen.append(kw.get("dir"))
-            super().__init__(*args, **kw)
+    def _spy(*args, **kw):
+        seen.append(kw.get("dir"))
+        return real(*args, **kw)
 
-    monkeypatch.setattr("cellstream.cell.writer.tempfile.TemporaryDirectory", _Spy)
+    monkeypatch.setattr(_tf, "mkdtemp", _spy)
     a = make_cell_adata()
     out = tmp_path / "sub" / "o.shad"
     out.parent.mkdir()

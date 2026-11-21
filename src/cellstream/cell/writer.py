@@ -9,11 +9,13 @@ adata[perm].copy()); grouping only changes order, not per-cell addressability.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import hashlib
 import json
 import mmap
 import os
+import shutil
 import tempfile
 import warnings
 from pathlib import Path
@@ -44,6 +46,13 @@ from .format import _plan_blocks
 # float copy (26 GB at 6.5B nnz) plus bool masks -- the #216 review finding. 16M elements is
 # 64 MB at float32. Rust needs none of this: CountU32 folds the check into the encode loop.
 _VALIDATE_CHUNK = 1 << 24
+
+# Prefix of the write staging directory. Kept stable because it is what a reader of the output
+# directory has to recognize as cellstream's own leftover (ArcInstitute/cellstream#2).
+_STAGING_PREFIX = "cellstream_cell_"
+
+# One retry for the transient NFS EBUSY on staging teardown; see _cell_staging_dir.
+_STAGING_REMOVE_ATTEMPTS = 2
 
 
 def _has_non_uint_value(data) -> bool:
@@ -612,6 +621,46 @@ def _stream_encode_block_python(
         payload_fh.write(frame)
         lens.append(len(frame))
     return lens, int(Xb.nnz), block_max
+
+
+def _remove_staging_dir(path: Path) -> bool:
+    """Remove ``path`` with one retry for the transient NFS ``EBUSY``; True when it is gone."""
+    for attempt in range(_STAGING_REMOVE_ATTEMPTS):
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if attempt == _STAGING_REMOVE_ATTEMPTS - 1:
+                return False
+        else:
+            return True
+    return False
+
+
+@contextlib.contextmanager
+def _cell_staging_dir(tmp_base: Path):
+    """Staging directory next to the output, torn down with a retrying ``rmtree``.
+
+    ``tempfile.TemporaryDirectory`` removes its directory in a single ``rmtree`` call. On NFS that
+    can fail with ``EBUSY`` while a handle is still open, leaving a ``cellstream_cell_*`` directory
+    (plus ``.nfs*`` silly-renames) beside the finished archive, where a publisher will seal it into
+    a dataset version (ArcInstitute/cellstream#2). Every encoder has closed its files by the time
+    this teardown runs, so one retry clears the transient case. If it still fails, the archive is
+    already written and valid: name the leftover path in a warning rather than fail the write.
+    """
+    path = Path(tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=str(tmp_base)))
+    try:
+        yield path
+    finally:
+        if not _remove_staging_dir(path):
+            warnings.warn(
+                f"layout='cell': could not remove the write staging directory {path}. The "
+                f"archive was written; delete that directory before publishing this output, or "
+                f"pass tmp_dir=... to stage somewhere that is not itself published.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 def _clear_cell_staging(tmpd) -> None:
@@ -1295,7 +1344,12 @@ def write_cell_archive(
         Scratch directory for the write staging area. Defaults to ``out_path.parent``
         (**not** ``TMPDIR``/``/tmp``): a grouped streaming write holds staging + final
         payload (~2x payload) there, and the output filesystem must hold the finished
-        archive anyway, whereas ``/tmp`` typically cannot hold even 1x payload.
+        archive anyway, whereas ``/tmp`` typically cannot hold even 1x payload. Staging is
+        removed on success (one retry for a transient NFS ``EBUSY``; a persistent failure warns
+        with the leftover path). If that directory is itself published or listed as output,
+        point ``tmp_dir`` somewhere else -- that is the only way to keep an *unremovable*
+        staging directory out of it. Doing this also keeps no ``*.lock`` sidecar behind: the
+        lock is unlinked on release (ArcInstitute/cellstream#2).
     """
     out_path = Path(out_path)
     if out_path.exists() and not overwrite:
@@ -1362,9 +1416,7 @@ def write_cell_archive(
             # existed, which is why this only surfaces now.
             tmp_base = Path(tmp_dir) if tmp_dir is not None else out_path.parent
             tmp_base.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix="cellstream_cell_", dir=str(tmp_base)) as tmpd:
-                tmpd = Path(tmpd)
-
+            with _cell_staging_dir(tmp_base) as tmpd:
                 # Encode OPTIMISTICALLY as the integer codec and let the encoder be the oracle:
                 # it already determines integrality per value, for free, fused into its loop. Asking
                 # up front instead cost an O(nnz) scan -- 86% of the write (146.8s -> 16.0s) and

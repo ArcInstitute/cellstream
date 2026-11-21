@@ -60,12 +60,12 @@ def test_pack_preserves_every_member_byte_for_byte(plain_dir, grouped_dir, tmp_p
         ]
         assert sorted(mem["name"] for mem in pa.members) == sorted(expected)
 
-        # ...and nothing loose was skipped. The one file in the directory that is NOT a member
-        # is the writer's lock sidecar -- v2/writer.py:443 creates out/.cellstream.lock and
-        # lock.py never removes it (the diagnostic body is left for post-mortem). So listing
-        # the directory is a real cross-check rather than a restatement of the line above: a
-        # member the enumerator forgot would surface here.
-        assert sorted(f.name for f in src.iterdir()) == sorted([*expected, ".cellstream.lock"])
+        # ...and nothing loose was skipped. The writer's lock sidecar `out/.cellstream.lock`
+        # is NOT in this list any more: acquire_write_lock unlinks it on release, so the
+        # finished directory holds the members and nothing else (#2). Listing the directory is
+        # still a real cross-check rather than a restatement of the line above: a member the
+        # enumerator forgot would surface here.
+        assert sorted(f.name for f in src.iterdir()) == sorted(expected)
 
         for name in expected:
             assert pa.member_bytes(name) == (src / name).read_bytes(), f"{src.name}/{name}"
